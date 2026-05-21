@@ -106,6 +106,7 @@ pub fn build_dynamic_schema(engine: Arc<WasmEngine>) -> Result<Schema> {
 
     Schema::build("Query", None, None)
         .register(query)
+        .enable_federation()
         .finish()
         .map_err(|e| anyhow::anyhow!("{}", e))
 }

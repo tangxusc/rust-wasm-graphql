@@ -1,10 +1,3 @@
-//! Rust + WASM + GraphQL 示例项目 - 主服务器入口
-//!
-//! 本程序：
-//! 1. 加载编译好的 WASM 模块（由 build.rs 自动编译）
-//! 2. 运行时内省 WASM 组件导出，动态生成 GraphQL schema
-//! 3. 启动 HTTP 服务器，提供 GraphQL 端点和 GraphiQL 交互界面
-
 mod graphql;
 mod wasm_engine;
 
@@ -13,13 +6,29 @@ use std::sync::Arc;
 use async_graphql_axum::GraphQL;
 use async_graphql::http::GraphiQLSource;
 use axum::{Router, response::Html, response::IntoResponse, routing::get};
+use clap::Parser;
 
 use crate::wasm_engine::WasmEngine;
 
-/// WASM 模块路径，由 build.rs 在编译时通过环境变量注入
-const WASM_MODULE_PATH: &str = env!("WASM_MODULE_PATH");
+const DEFAULT_WASM_PATH: &str = env!("DEFAULT_WASM_PATH");
 
-/// GraphiQL 交互界面处理函数
+#[derive(Parser)]
+#[command(name = "host-server")]
+#[command(about = "加载任意 WASM 组件并暴露为 GraphQL 接口")]
+struct Cli {
+    /// WASM 组件文件路径
+    #[arg(long = "wasm", default_value = DEFAULT_WASM_PATH)]
+    wasm_path: String,
+
+    /// 监听地址
+    #[arg(long, default_value = "0.0.0.0:8080")]
+    addr: String,
+}
+
+async fn health() -> impl IntoResponse {
+    "OK"
+}
+
 async fn graphiql() -> impl IntoResponse {
     Html(
         GraphiQLSource::build()
@@ -30,10 +39,11 @@ async fn graphiql() -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    println!("正在加载 WASM 模块: {}", WASM_MODULE_PATH);
+    let cli = Cli::parse();
 
-    // 初始化 WASM 引擎，加载编译好的模块
-    let wasm_engine = Arc::new(WasmEngine::new(WASM_MODULE_PATH)?);
+    println!("正在加载 WASM 模块: {}", cli.wasm_path);
+
+    let wasm_engine = Arc::new(WasmEngine::new(&cli.wasm_path)?);
 
     println!("WASM 模块加载成功");
     println!("发现 {} 个导出函数:", wasm_engine.descriptors().len());
@@ -43,15 +53,14 @@ async fn main() -> anyhow::Result<()> {
 
     let schema = graphql::build_dynamic_schema(wasm_engine)?;
 
-    // 配置路由：GraphQL 端点 + GraphiQL 界面
     let app = Router::new()
-        .route("/graphql", get(graphiql).post_service(GraphQL::new(schema)));
+        .route("/graphql", get(graphiql).post_service(GraphQL::new(schema)))
+        .route("/health", get(health));
 
-    let addr = "0.0.0.0:8080";
-    println!("服务器启动于 http://{}", addr);
-    println!("GraphiQL 界面: http://localhost:8080/graphql");
+    println!("服务器启动于 http://{}", cli.addr);
+    println!("GraphiQL 界面: http://{}/graphql", cli.addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(&cli.addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())

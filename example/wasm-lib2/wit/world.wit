@@ -1,0 +1,11 @@
+package example:strings;
+
+interface text {
+    reverse: func(input: string) -> string;
+    char-count: func(input: string) -> u32;
+    repeat: func(input: string, times: u32) -> string;
+}
+
+world string-utils {
+    export text;
+}

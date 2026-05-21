@@ -1,4 +1,4 @@
 [workspace]
-members = ["wasm-lib", "host-server"]
+members = ["example/wasm-lib", "example/wasm-lib2", "host-server"]
 default-members = ["host-server"]
 resolver = "2"

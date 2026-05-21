@@ -2,9 +2,8 @@ use anyhow::{anyhow, Result};
 use wasmtime::component::{Component, ComponentExportIndex, Linker, ResourceTable, Val};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
-use wit_parser::{Resolve, Results, Type as WitAstType};
-
-const WIT_SOURCE: &str = include_str!("../../wit/world.wit");
+use wit_parser::decoding::{decode, DecodedWasm};
+use wit_parser::{Results, Type as WitAstType, WorldItem};
 
 #[derive(Debug, Clone)]
 pub enum WitType {
@@ -62,14 +61,17 @@ pub struct WasmEngine {
 
 impl WasmEngine {
     pub fn new(wasm_path: &str) -> Result<Self> {
+        let wasm_bytes = std::fs::read(wasm_path)
+            .map_err(|e| anyhow!("failed to read wasm file '{}': {}", wasm_path, e))?;
+
         let mut config = Config::new();
         config.wasm_component_model(true);
         let engine = Engine::new(&config)?;
-        let component = Component::from_file(&engine, wasm_path)?;
+        let component = Component::new(&engine, &wasm_bytes)?;
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::add_to_linker_sync(&mut linker)?;
 
-        let wit_funcs = parse_wit_functions(WIT_SOURCE)?;
+        let wit_funcs = extract_wit_functions(&wasm_bytes)?;
         let (descriptors, interface_export) =
             Self::introspect(&component, &engine, &wit_funcs)?;
 
@@ -195,28 +197,58 @@ fn wit_ast_type_to_wit_type(ty: &WitAstType) -> WitType {
     }
 }
 
-fn parse_wit_functions(wit: &str) -> Result<Vec<(String, Vec<(String, WitType)>, WitType)>> {
-    let mut resolve = Resolve::default();
-    let pkg_id = resolve.push_str("world.wit", wit)?;
-    let pkg = &resolve.packages[pkg_id];
+fn extract_wit_functions(
+    wasm_bytes: &[u8],
+) -> Result<Vec<(String, Vec<(String, WitType)>, WitType)>> {
+    let decoded = decode(wasm_bytes)
+        .map_err(|e| anyhow!("failed to decode WIT from component: {}", e))?;
 
+    let (resolve, world_id) = match decoded {
+        DecodedWasm::Component(resolve, world_id) => (resolve, world_id),
+        DecodedWasm::WitPackage(..) => {
+            return Err(anyhow!("expected a component, got a WIT package"));
+        }
+    };
+
+    let world = &resolve.worlds[world_id];
     let mut funcs = Vec::new();
-    for (_iface_name, &iface_id) in &pkg.interfaces {
-        let iface = &resolve.interfaces[iface_id];
-        for (func_name, func) in &iface.functions {
-            let params: Vec<(String, WitType)> = func.params.iter()
-                .map(|(name, ty)| (name.clone(), wit_ast_type_to_wit_type(ty)))
-                .collect();
 
-            let result_type = match &func.results {
-                Results::Anon(ty) => wit_ast_type_to_wit_type(ty),
-                Results::Named(named) => named.first()
-                    .map(|(_, ty)| wit_ast_type_to_wit_type(ty))
-                    .unwrap_or(WitType::String),
-            };
+    for (_key, item) in &world.exports {
+        match item {
+            WorldItem::Interface { id, .. } => {
+                let iface = &resolve.interfaces[*id];
+                for (func_name, func) in &iface.functions {
+                    let params: Vec<(String, WitType)> = func.params.iter()
+                        .map(|(name, ty)| (name.clone(), wit_ast_type_to_wit_type(ty)))
+                        .collect();
 
-            funcs.push((func_name.clone(), params, result_type));
+                    let result_type = match &func.results {
+                        Results::Anon(ty) => wit_ast_type_to_wit_type(ty),
+                        Results::Named(named) => named.first()
+                            .map(|(_, ty)| wit_ast_type_to_wit_type(ty))
+                            .unwrap_or(WitType::String),
+                    };
+
+                    funcs.push((func_name.clone(), params, result_type));
+                }
+            }
+            WorldItem::Function(func) => {
+                let params: Vec<(String, WitType)> = func.params.iter()
+                    .map(|(name, ty)| (name.clone(), wit_ast_type_to_wit_type(ty)))
+                    .collect();
+
+                let result_type = match &func.results {
+                    Results::Anon(ty) => wit_ast_type_to_wit_type(ty),
+                    Results::Named(named) => named.first()
+                        .map(|(_, ty)| wit_ast_type_to_wit_type(ty))
+                        .unwrap_or(WitType::String),
+                };
+
+                funcs.push((func.name.clone(), params, result_type));
+            }
+            WorldItem::Type(_) => {}
         }
     }
+
     Ok(funcs)
 }
