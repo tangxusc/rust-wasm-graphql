@@ -1,0 +1,11 @@
+package example:calculator;
+
+interface compute {
+    add: func(a: s32, b: s32) -> s32;
+    fibonacci: func(n: s32) -> s64;
+    to-uppercase: func(input: string) -> string;
+}
+
+world calculator {
+    export compute;
+}

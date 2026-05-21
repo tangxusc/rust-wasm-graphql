@@ -1,0 +1,14 @@
+[package]
+name = "wasm-lib"
+version = "0.1.0"
+edition = "2021"
+description = "WASM Component：通过 WIT 接口导出计算函数"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.36"
+
+[package.metadata.component]
+package = "example:calculator"

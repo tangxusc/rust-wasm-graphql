@@ -1,0 +1,15 @@
+[package]
+name = "host-server"
+version = "0.1.0"
+edition = "2021"
+description = "GraphQL 服务器：加载 WASM 模块并暴露为 GraphQL 接口"
+
+[dependencies]
+wasmtime = { version = "27", features = ["component-model"] }
+wasmtime-wasi = "27"
+async-graphql = "7"
+async-graphql-axum = "7"
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+wit-parser = "0.219"
