@@ -5,30 +5,40 @@ use std::process::Command;
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let workspace_root = manifest_dir.parent().unwrap();
-    let wasm_lib_dir = workspace_root.join("example/wasm-lib");
+    let example_dir = workspace_root.join("example");
 
-    println!("cargo:rerun-if-changed=../example/wasm-lib/src/lib.rs");
-    println!("cargo:rerun-if-changed=../example/wasm-lib/Cargo.toml");
-    println!("cargo:rerun-if-changed=../example/wit/world.wit");
+    let modules = vec![
+        ("wasm-lib", "wasm_lib"),
+        ("wasm-lib2", "wasm_lib2"),
+    ];
 
-    let status = Command::new("cargo")
-        .args(["component", "build", "--release", "--manifest-path"])
-        .arg(wasm_lib_dir.join("Cargo.toml").to_str().unwrap())
-        .status()
-        .expect("cargo component build failed");
+    for (dir_name, _artifact_name) in &modules {
+        let lib_dir = example_dir.join(dir_name);
+        if !lib_dir.exists() {
+            continue;
+        }
 
-    if !status.success() {
-        panic!("wasm-lib component build failed");
+        println!("cargo:rerun-if-changed=../example/{}/src/lib.rs", dir_name);
+        println!("cargo:rerun-if-changed=../example/{}/Cargo.toml", dir_name);
+        println!("cargo:rerun-if-changed=../example/{}/wit", dir_name);
+
+        let status = Command::new("cargo")
+            .args(["component", "build", "--release", "--manifest-path"])
+            .arg(lib_dir.join("Cargo.toml").to_str().unwrap())
+            .status()
+            .expect("cargo component build failed");
+
+        if !status.success() {
+            panic!("{} component build failed", dir_name);
+        }
     }
 
-    let component_path = workspace_root
+    println!("cargo:rerun-if-changed=../example/wit/world.wit");
+
+    let wasm_dir = workspace_root
         .join("target")
         .join("wasm32-wasip1")
-        .join("release")
-        .join("wasm_lib.wasm");
+        .join("release");
 
-    println!(
-        "cargo:rustc-env=DEFAULT_WASM_PATH={}",
-        component_path.display()
-    );
+    println!("cargo:rustc-env=DEFAULT_WASM_DIR={}", wasm_dir.display());
 }

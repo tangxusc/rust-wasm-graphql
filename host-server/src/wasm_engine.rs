@@ -57,6 +57,7 @@ pub struct WasmEngine {
     linker: Linker<State>,
     descriptors: Vec<FunctionDescriptor>,
     interface_export: ComponentExportIndex,
+    module_name: String,
 }
 
 impl WasmEngine {
@@ -71,11 +72,15 @@ impl WasmEngine {
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::add_to_linker_sync(&mut linker)?;
 
-        let wit_funcs = extract_wit_functions(&wasm_bytes)?;
+        let (wit_funcs, module_name) = extract_wit_functions(&wasm_bytes)?;
         let (descriptors, interface_export) =
             Self::introspect(&component, &engine, &wit_funcs)?;
 
-        Ok(Self { engine, component, linker, descriptors, interface_export })
+        Ok(Self { engine, component, linker, descriptors, interface_export, module_name })
+    }
+
+    pub fn module_name(&self) -> &str {
+        &self.module_name
     }
 
     pub fn descriptors(&self) -> &[FunctionDescriptor] {
@@ -163,7 +168,7 @@ impl WasmEngine {
     }
 }
 
-fn kebab_to_camel(s: &str) -> String {
+pub fn kebab_to_camel(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut capitalize_next = false;
     for ch in s.chars() {
@@ -179,7 +184,7 @@ fn kebab_to_camel(s: &str) -> String {
     result
 }
 
-fn wit_ast_type_to_wit_type(ty: &WitAstType) -> WitType {
+pub fn wit_ast_type_to_wit_type(ty: &WitAstType) -> WitType {
     match ty {
         WitAstType::S8 => WitType::S8,
         WitAstType::S16 => WitType::S16,
@@ -197,9 +202,9 @@ fn wit_ast_type_to_wit_type(ty: &WitAstType) -> WitType {
     }
 }
 
-fn extract_wit_functions(
+pub fn extract_wit_functions(
     wasm_bytes: &[u8],
-) -> Result<Vec<(String, Vec<(String, WitType)>, WitType)>> {
+) -> Result<(Vec<(String, Vec<(String, WitType)>, WitType)>, String)> {
     let decoded = decode(wasm_bytes)
         .map_err(|e| anyhow!("failed to decode WIT from component: {}", e))?;
 
@@ -211,12 +216,24 @@ fn extract_wit_functions(
     };
 
     let world = &resolve.worlds[world_id];
+
+    let mut module_name = world.package.and_then(|pkg_id| {
+        let pkg = &resolve.packages[pkg_id];
+        Some(pkg.name.name.clone())
+    }).unwrap_or_else(|| "unknown".to_string());
+
     let mut funcs = Vec::new();
 
     for (_key, item) in &world.exports {
         match item {
             WorldItem::Interface { id, .. } => {
                 let iface = &resolve.interfaces[*id];
+
+                if let Some(pkg_id) = iface.package {
+                    let pkg = &resolve.packages[pkg_id];
+                    module_name = pkg.name.name.clone();
+                }
+
                 for (func_name, func) in &iface.functions {
                     let params: Vec<(String, WitType)> = func.params.iter()
                         .map(|(name, ty)| (name.clone(), wit_ast_type_to_wit_type(ty)))
@@ -250,5 +267,117 @@ fn extract_wit_functions(
         }
     }
 
-    Ok(funcs)
+    Ok((funcs, module_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kebab_to_camel_simple() {
+        assert_eq!(kebab_to_camel("hello-world"), "helloWorld");
+    }
+
+    #[test]
+    fn test_kebab_to_camel_no_dash() {
+        assert_eq!(kebab_to_camel("hello"), "hello");
+    }
+
+    #[test]
+    fn test_kebab_to_camel_multiple_dashes() {
+        assert_eq!(kebab_to_camel("get-user-name"), "getUserName");
+    }
+
+    #[test]
+    fn test_kebab_to_camel_empty() {
+        assert_eq!(kebab_to_camel(""), "");
+    }
+
+    #[test]
+    fn test_kebab_to_camel_single_char_segments() {
+        assert_eq!(kebab_to_camel("a-b-c"), "aBC");
+    }
+
+    #[test]
+    fn test_wit_ast_type_to_wit_type_integers() {
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::S8), WitType::S8));
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::S16), WitType::S16));
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::S32), WitType::S32));
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::S64), WitType::S64));
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::U8), WitType::U8));
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::U16), WitType::U16));
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::U32), WitType::U32));
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::U64), WitType::U64));
+    }
+
+    #[test]
+    fn test_wit_ast_type_to_wit_type_floats() {
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::F32), WitType::Float32));
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::F64), WitType::Float64));
+    }
+
+    #[test]
+    fn test_wit_ast_type_to_wit_type_bool_string() {
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::Bool), WitType::Bool));
+        assert!(matches!(wit_ast_type_to_wit_type(&WitAstType::String), WitType::String));
+    }
+
+    #[test]
+    fn test_extract_wit_from_calculator_wasm() {
+        let wasm_dir = env!("DEFAULT_WASM_DIR");
+        let wasm_path = format!("{}/wasm_lib.wasm", wasm_dir);
+        let bytes = std::fs::read(&wasm_path).unwrap();
+        let (funcs, module_name) = extract_wit_functions(&bytes).unwrap();
+        assert_eq!(module_name, "calculator");
+        assert_eq!(funcs.len(), 3);
+        let func_names: Vec<&str> = funcs.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(func_names.contains(&"add"));
+        assert!(func_names.contains(&"fibonacci"));
+        assert!(func_names.contains(&"to-uppercase"));
+    }
+
+    #[test]
+    fn test_extract_wit_from_strings_wasm() {
+        let wasm_dir = env!("DEFAULT_WASM_DIR");
+        let wasm_path = format!("{}/wasm_lib2.wasm", wasm_dir);
+        let bytes = std::fs::read(&wasm_path).unwrap();
+        let (funcs, module_name) = extract_wit_functions(&bytes).unwrap();
+        assert_eq!(module_name, "strings");
+        assert_eq!(funcs.len(), 3);
+        let func_names: Vec<&str> = funcs.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(func_names.contains(&"reverse"));
+        assert!(func_names.contains(&"char-count"));
+        assert!(func_names.contains(&"repeat"));
+    }
+
+    #[test]
+    fn test_wasm_engine_new_and_call() {
+        let wasm_dir = env!("DEFAULT_WASM_DIR");
+        let wasm_path = format!("{}/wasm_lib.wasm", wasm_dir);
+        let engine = WasmEngine::new(&wasm_path).unwrap();
+        assert_eq!(engine.module_name(), "calculator");
+        assert!(!engine.descriptors().is_empty());
+
+        let result = engine.call_function(
+            "add",
+            &[Val::S32(3), Val::S32(4)],
+        ).unwrap();
+        assert_eq!(result, Val::S32(7));
+    }
+
+    #[test]
+    fn test_wasm_engine_call_nonexistent_function() {
+        let wasm_dir = env!("DEFAULT_WASM_DIR");
+        let wasm_path = format!("{}/wasm_lib.wasm", wasm_dir);
+        let engine = WasmEngine::new(&wasm_path).unwrap();
+        let result = engine.call_function("nonexistent", &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wasm_engine_invalid_path() {
+        let result = WasmEngine::new("/nonexistent/path.wasm");
+        assert!(result.is_err());
+    }
 }

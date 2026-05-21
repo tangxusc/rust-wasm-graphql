@@ -39,6 +39,15 @@
 │   ├── wasm-lib/         示例 WASM 组件（calculator）
 │   └── wasm-lib2/        示例 WASM 组件（string-utils）
 └── host-server/          GraphQL 宿主服务器
+    ├── src/
+    │   ├── lib.rs        库入口（导出公共模块）
+    │   ├── main.rs       CLI 入口
+    │   ├── wasm_engine.rs    WASM 组件加载与调用
+    │   ├── wasm_registry.rs  多模块注册管理
+    │   └── graphql.rs        动态 Schema 生成
+    ├── tests/
+    │   └── e2e_test.rs   端到端集成测试
+    └── build.rs          自动编译示例 WASM 组件
 ```
 
 ## 支持的 WIT 类型
@@ -79,24 +88,33 @@ cargo run
 ### 2. 加载自定义 WASM 组件
 
 ```bash
-cargo run -- --wasm /path/to/your_component.wasm
+cargo run -- --wasm-dir /path/to/your_components/
 ```
 
 指定监听地址：
 
 ```bash
-cargo run -- --wasm ./my_component.wasm --addr 127.0.0.1:3000
+cargo run -- --wasm-dir ./my_components --addr 127.0.0.1:3000
 ```
+
+> 注意：目录中的非组件 `.wasm` 文件会被自动跳过并输出提示。
 
 ### 3. 调用 GraphQL API
 
-启动后，所有 WASM 导出函数自动映射为 GraphQL Query 字段。以内置 calculator 示例为例：
+启动后，所有 WASM 导出函数自动映射为 GraphQL Query 字段。以内置示例为例：
 
 ```graphql
 query {
-  add(a: 1, b: 2)
-  fibonacci(n: 10)
-  toUppercase(input: "hello")
+  calculator {
+    add(a: 1, b: 2)
+    fibonacci(n: 10)
+    toUppercase(input: "hello")
+  }
+  strings {
+    reverse(input: "world")
+    charCount(input: "hello")
+    repeat(input: "ab", times: 3)
+  }
 }
 ```
 
@@ -105,12 +123,46 @@ query {
 ```json
 {
   "data": {
-    "add": 3,
-    "fibonacci": "55",
-    "toUppercase": "HELLO"
+    "calculator": {
+      "add": 3,
+      "fibonacci": "55",
+      "toUppercase": "HELLO"
+    },
+    "strings": {
+      "reverse": "dlrow",
+      "charCount": 5,
+      "repeat": "ababab"
+    }
   }
 }
 ```
+
+## 测试
+
+项目包含完整的测试套件，覆盖单元测试和端到端集成测试。
+
+```bash
+# 运行所有测试
+cargo test
+
+# 仅运行单元测试
+cargo test --lib
+
+# 仅运行端到端集成测试
+cargo test --test e2e_test
+```
+
+### 测试结构
+
+- **单元测试**（`src/*.rs` 中的 `#[cfg(test)] mod tests`）
+  - `wasm_engine` — kebab_to_camel 转换、WIT 类型映射、组件加载与调用
+  - `graphql` — to_pascal_case 转换、TypeRef 映射
+  - `wasm_registry` — 目录扫描、重复检测、错误处理
+- **端到端测试**（`tests/e2e_test.rs`）
+  - 启动完整 HTTP 服务器
+  - 通过 HTTP 发送 GraphQL 请求
+  - 验证 calculator 和 strings 模块的所有函数
+  - 测试多模块联合查询、错误处理、GraphQL 内省
 
 ## 编写自定义 WASM 组件
 
