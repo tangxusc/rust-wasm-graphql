@@ -59,10 +59,46 @@ pub struct WalListener {
     slot_name: String,
     publication: String,
     kafka_producer: Arc<KafkaPublisher>,
+    connect_config: tokio_postgres::Config,
+    max_retries: u32,
+    base_backoff: Duration,
 }
 
 impl WalListener {
-    pub async fn run(&self, client: &Client) -> Result<!> {
+    pub async fn run(&self) -> ! {
+        let mut consecutive_failures = 0u32;
+
+        loop {
+            match self.run_stream().await {
+                Ok(()) => {
+                    // stream 正常结束（不应发生），重置计数器后重连
+                    consecutive_failures = 0;
+                    tracing::warn!("WAL stream 意外结束，立即重连");
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    let backoff = self.calculate_backoff(consecutive_failures);
+                    tracing::error!(
+                        "WAL 监听失败 (连续第 {consecutive_failures} 次): {e}, \
+                         {backoff:?} 后重试"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+
+    /// 指数退避：base * 2^(failures-1)，上限 60s
+    fn calculate_backoff(&self, failures: u32) -> Duration {
+        let multiplier = 2u64.pow((failures - 1).min(6));
+        let backoff = self.base_backoff * multiplier as u32;
+        backoff.min(Duration::from_secs(60))
+    }
+
+    async fn run_stream(&self) -> Result<()> {
+        let (client, connection) = self.connect_config.connect(tokio_postgres::NoTls).await?;
+        tokio::spawn(connection);
+
         let stream = client
             .copy_both_simple::<bytes::Bytes>(&format!(
                 "START_REPLICATION SLOT {} LOGICAL 0/0 (proto_version '1', publication_names '{}')",
@@ -77,16 +113,18 @@ impl WalListener {
                 ReplicationMessage::XLogData(data) => {
                     let events = self.parse_wal_events(&data.data())?;
                     self.kafka_producer.publish(&events).await?;
-                    // 确认 LSN，推进 replication slot
-                    stream.standby_status_update(data.wal_end(), data.wal_end(), data.wal_end(), 0, 0).await?;
+                    let lsn = data.wal_end();
+                    stream.standby_status_update(lsn, lsn, PgLsn::from(0), 0, 0).await?;
                 }
                 ReplicationMessage::PrimaryKeepAlive(ka) if ka.reply() == 1 => {
-                    stream.standby_status_update(ka.wal_end(), ka.wal_end(), ka.wal_end(), 0, 0).await?;
+                    let lsn = ka.wal_end();
+                    stream.standby_status_update(lsn, lsn, PgLsn::from(0), 0, 0).await?;
                 }
                 _ => {}
             }
         }
-        unreachable!()
+
+        Ok(())
     }
 }
 ```
@@ -189,8 +227,9 @@ impl KafkaPublisher {
             .set("linger.ms", "5")              // 批量发送延迟
             .set("batch.num.messages", "1000")   // 批量大小
             .set("compression.type", "lz4")      // 压缩
-            .set("acks", "1")                    // leader 确认即可
+            .set("acks", "all")                  // 所有 ISR 副本确认，保证不丢消息
             .set("retries", "3")
+            .set("enable.idempotence", "true")   // 生产者幂等，防止重复投递
             .create()
             .unwrap();
 

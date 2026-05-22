@@ -55,9 +55,10 @@ snapshot:{aggregate_type}:{aggregate_id}
 ```rust
 #[async_trait]
 pub trait SnapshotStore: Send + Sync {
-    async fn load(&self, aggregate_id: &str) -> Result<Option<Snapshot>>;
+    /// 加载快照（需要 aggregate_type 构造完整 key）
+    async fn load(&self, aggregate_type: &str, aggregate_id: &str) -> Result<Option<Snapshot>>;
     async fn save(&self, snapshot: &Snapshot) -> Result<()>;
-    async fn delete(&self, aggregate_id: &str) -> Result<()>;
+    async fn delete(&self, aggregate_type: &str, aggregate_id: &str) -> Result<()>;
     async fn delete_by_type(&self, aggregate_type: &str) -> Result<u64>;
 }
 ```
@@ -83,10 +84,8 @@ pub struct SnapshotPolicy {
 
 ```rust
 impl VirtualActor {
-    /// 休眠前的清理：刷盘 + 保存快照
+    /// 休眠前的清理：保存快照（强一致版无需 flush，事件已同步写入）
     async fn on_deactivate(&mut self) {
-        self.flush().await;
-
         let snapshot = Snapshot {
             aggregate_id: self.aggregate_id.clone(),
             aggregate_type: self.module_name.clone(),

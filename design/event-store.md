@@ -55,8 +55,14 @@ CREATE TABLE events (
     UNIQUE (aggregate_id, version)
 );
 
--- 批量写入优化：减少索引数量
-CREATE INDEX idx_events_aggregate ON events (aggregate_id, version);
+-- 幂等键表（与 events 同库，支持同事务写入）
+CREATE TABLE idempotency_keys (
+    command_id      VARCHAR(128) PRIMARY KEY,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 幂等键自动过期清理（72 小时）
+CREATE INDEX idx_idempotency_created ON idempotency_keys (created_at);
 ```
 
 ### 写入优化配置（PostgreSQL）
@@ -74,9 +80,33 @@ CREATE TABLE events (
     -- ... 同上
 ) PARTITION BY RANGE (created_at);
 
-CREATE TABLE events_2024_q1 PARTITION OF events
-    FOR VALUES FROM ('2024-01-01') TO ('2024-04-01');
+-- 分区自动管理（推荐使用 pg_partman 或自定义定时任务）
+-- 自动创建未来分区 + 归档过期分区
+-- 示例：按季度分区，提前创建下一季度分区
 ```
+
+### 分区自动管理
+
+生产环境必须自动管理分区，避免手动创建导致遗漏：
+
+```sql
+-- 方案 A：使用 pg_partman（推荐）
+SELECT partman.create_parent(
+    p_parent_table := 'public.events',
+    p_control := 'created_at',
+    p_type := 'native',
+    p_interval := '3 months',
+    p_premake := 2  -- 提前创建 2 个未来分区
+);
+
+-- 方案 B：自定义定时任务（pg_cron）
+-- 每月 1 日检查并创建下季度分区
+SELECT cron.schedule('create-event-partitions', '0 0 1 * *', $$
+    SELECT partman.run_maintenance('public.events');
+$$);
+```
+
+归档策略：超过保留期（如 1 年）的分区可 detach 后归档到冷存储（S3）。
 
 ## Trait 定义
 
@@ -111,7 +141,12 @@ pub struct PendingEvent {
 
 #[derive(Debug)]
 pub enum StoreError {
-    VersionConflict { expected: u64, actual: u64 },
+    VersionConflict {
+        aggregate_id: String,
+        expected_version: u64,
+        attempted_version: u64,
+    },
+    DuplicateCommand(String),
     ConnectionError(String),
     SerializationError(String),
 }
@@ -119,14 +154,17 @@ pub enum StoreError {
 /// 单分片事件存储接口
 #[async_trait]
 pub trait EventStoreShard: Send + Sync {
-    /// 同步追加事件（核心写入路径）
+    /// 同步追加事件 + 幂等键（同一事务，原子保证）
     /// 调用方等待此方法返回后才响应客户端，保证零数据丢失
-    async fn append(
+    async fn append_with_idempotency(
         &self,
         aggregate_id: &str,
         events: &[PendingEvent],
         expected_version: u64,
+        command_id: &str,
     ) -> Result<(), StoreError>;
+
+    /// 批量追加（无幂等键，用于数据迁移等场景）
     async fn batch_append(&self, events: &[PendingEvent]) -> Result<(), StoreError>;
 
     /// 加载聚合的全部事件（Virtual Actor 激活时使用）
@@ -141,25 +179,43 @@ pub trait EventStoreShard: Send + Sync {
 
     /// 获取聚合当前版本号
     async fn current_version(&self, aggregate_id: &str) -> Result<u64, StoreError>;
+
+    /// 检查幂等键是否存在
+    async fn idempotency_exists(&self, command_id: &str) -> Result<bool, StoreError>;
 }
 ```
 
-## 同步写入实现
+## 同步写入实现（含事务级幂等）
 
 ```rust
-/// 同步写入 — 单次事务写入单个聚合的事件，等待 DB 确认
-/// 这是强一致性的核心：此方法返回 Ok 意味着事件已落盘
-async fn append(
+/// 同步写入 — 事件 + 幂等键在同一事务中写入，原子保证
+/// 此方法返回 Ok 意味着：事件已落盘 + 幂等键已记录，无窗口丢失
+async fn append_with_idempotency(
     &self,
     aggregate_id: &str,
     events: &[PendingEvent],
     expected_version: u64,
+    command_id: &str,
 ) -> Result<(), StoreError> {
     if events.is_empty() { return Ok(()); }
 
     let mut tx = self.pool.begin().await
         .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
 
+    // 写入幂等键（ON CONFLICT 检测重复命令）
+    let inserted = sqlx::query(
+        "INSERT INTO idempotency_keys (command_id) VALUES ($1) ON CONFLICT DO NOTHING"
+    )
+    .bind(command_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+
+    if inserted.rows_affected() == 0 {
+        return Err(StoreError::DuplicateCommand(command_id.to_string()));
+    }
+
+    // 写入事件
     for (i, event) in events.iter().enumerate() {
         let version = expected_version + 1 + i as u64;
         sqlx::query(
@@ -176,8 +232,9 @@ async fn append(
         .map_err(|e| match e {
             sqlx::Error::Database(ref db_err) if db_err.code() == Some("23505".into()) => {
                 StoreError::VersionConflict {
-                    expected: expected_version,
-                    actual: version,
+                    aggregate_id: aggregate_id.to_string(),
+                    expected_version,
+                    attempted_version: version,
                 }
             }
             _ => StoreError::ConnectionError(e.to_string()),
@@ -204,39 +261,90 @@ async fn append(
 
 ## 幂等存储（双层设计）
 
-### 第一层：本地布隆过滤器（零 IO）
+### 第一层：滚动布隆过滤器（零 IO，防无限增长）
 
 ```rust
 use probabilistic_collections::bloom::BloomFilter;
+use parking_lot::RwLock;
 
-pub struct LocalIdempotencyFilter {
-    filter: RwLock<BloomFilter<str>>,
-    false_positive_rate: f64,  // 0.01 (1%)
+/// 滚动布隆过滤器：两代交替，防止无限增长导致误判率飙升
+/// 轮换操作使用单一写锁保护，确保原子性
+pub struct RollingBloomFilter {
+    inner: RwLock<BloomFilterInner>,
+    capacity: usize,
+    false_positive_rate: f64,
 }
 
-impl LocalIdempotencyFilter {
+struct BloomFilterInner {
+    current: BloomFilter<str>,
+    previous: BloomFilter<str>,
+    inserted: usize,
+    rotate_threshold: usize,
+}
+
+impl RollingBloomFilter {
+    pub fn new(capacity: usize, fp_rate: f64) -> Self {
+        Self {
+            inner: RwLock::new(BloomFilterInner {
+                current: BloomFilter::with_rate(fp_rate, capacity),
+                previous: BloomFilter::with_rate(fp_rate, capacity),
+                inserted: 0,
+                rotate_threshold: (capacity as f64 * 0.8) as usize,
+            }),
+            capacity,
+            false_positive_rate: fp_rate,
+        }
+    }
+
     /// 快速排除：返回 false 则一定不存在
     pub fn might_contain(&self, command_id: &str) -> bool {
-        self.filter.read().unwrap().contains(command_id)
+        let inner = self.inner.read();
+        inner.current.contains(command_id) || inner.previous.contains(command_id)
     }
 
     pub fn insert(&self, command_id: &str) {
-        self.filter.write().unwrap().insert(command_id);
+        let mut inner = self.inner.write();
+        inner.current.insert(command_id);
+        inner.inserted += 1;
+        if inner.inserted >= inner.rotate_threshold {
+            // 轮换在同一写锁内完成，保证原子性
+            let new_filter = BloomFilter::with_rate(self.false_positive_rate, self.capacity);
+            let old_current = std::mem::replace(&mut inner.current, new_filter);
+            inner.previous = old_current;
+            inner.inserted = 0;
+        }
     }
 }
 ```
 
-### 第二层：KV 精确检查（仅布隆过滤器命中时触发）
+**容量规划**：
+
+| 日命令量 | 单代容量 | 内存占用 | 轮换频率 |
+|----------|---------|---------|---------|
+| 100万/天 | 200万 | ~2.4 MB | ~1次/天 |
+| 1000万/天 | 2000万 | ~24 MB | ~1次/天 |
+| 1亿/天 | 2亿 | ~240 MB | ~1次/天 |
+
+注：进程重启后布隆过滤器为空，所有请求穿透到 DB 层的 `idempotency_keys` 表。
+由于幂等键已在 Event Store 同事务中写入，DB 层查询是正确性兜底，布隆过滤器仅为性能优化。
+
+### 第二层：DB 精确检查（事务内，仅布隆过滤器命中时触发）
+
+幂等键存储在 Event Store 同库的 `idempotency_keys` 表中（见上方 DDL），
+通过 `append_with_idempotency` 在同一事务中原子写入。
+
+**重要**：幂等键与事件在同一事务中写入，因此幂等键存储在 aggregate_id 所在的分片。
+Gateway 层的幂等检查必须按 aggregate_id 路由到正确分片：
 
 ```rust
-#[async_trait]
-pub trait IdempotencyStore: Send + Sync {
-    async fn exists(&self, command_id: &str) -> Result<bool>;
-    async fn record(&self, command_id: &str, ttl: Duration) -> Result<()>;
+impl ShardedEventStore {
+    pub async fn idempotency_exists(&self, aggregate_id: &str, command_id: &str) -> Result<bool> {
+        // 幂等键随事件写入 aggregate_id 所在分片，查询时必须路由到同一分片
+        let shard = self.shard_for(aggregate_id);
+        shard.idempotency_exists(command_id).await
+    }
 }
 ```
-
-Key 格式：`cmd:{command_id}`，TTL 24-72 小时。
 
 ### 性能对比
 

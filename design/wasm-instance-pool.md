@@ -35,6 +35,7 @@ pub struct WasmInstancePool {
     module_name: String,
     engine: Arc<wasmtime::Engine>,
     component: Arc<wasmtime::component::Component>,
+    linker: Arc<wasmtime::component::Linker<WasiState>>,  // 共享 Linker，避免重复创建
     pool: Arc<ArrayQueue<WasmInstance>>,
     pool_size: usize,
 }
@@ -53,10 +54,11 @@ impl WasmInstancePool {
         pool_size: usize,
     ) -> Result<Self> {
         let pool = Arc::new(ArrayQueue::new(pool_size));
+        let linker = Arc::new(Self::create_linker(&engine));
 
         // 预热：提前实例化所有实例
         for _ in 0..pool_size {
-            let instance = Self::create_instance(&engine, &component)?;
+            let instance = Self::create_instance(&engine, &component, &linker)?;
             pool.push(instance).unwrap();
         }
 
@@ -64,50 +66,63 @@ impl WasmInstancePool {
             module_name: module_name.to_string(),
             engine,
             component,
+            linker,
             pool,
             pool_size,
         })
     }
 
-    /// 从池中获取实例（无锁）
-    pub fn acquire(&self) -> Result<PooledInstance> {
+    /// 从池中获取实例（异步安全：池耗尽时通过 spawn_blocking 创建临时实例）
+    pub async fn acquire(&self) -> Result<PooledInstance> {
         match self.pool.pop() {
-            Some(instance) => Ok(PooledInstance {
-                instance: Some(instance),
-                pool: self.pool.clone(),
-            }),
+            Some(instance) => Ok(PooledInstance::pooled(instance, self.pool.clone())),
             None => {
-                // 池耗尽：创建临时实例（不归还池）
-                let instance = Self::create_instance(&self.engine, &self.component)?;
-                Ok(PooledInstance {
-                    instance: Some(instance),
-                    pool: self.pool.clone(),
-                })
+                // 池耗尽：在阻塞线程池中创建临时实例，避免阻塞 tokio worker
+                let engine = self.engine.clone();
+                let component = self.component.clone();
+                let linker = self.linker.clone();
+                let instance = tokio::task::spawn_blocking(move || {
+                    Self::create_instance(&engine, &component, &linker)
+                }).await.map_err(|e| Error::internal(e.to_string()))??;
+                Ok(PooledInstance::temporary(instance))
             }
         }
+    }
+
+    fn create_linker(engine: &wasmtime::Engine) -> wasmtime::component::Linker<WasiState> {
+        let mut linker = wasmtime::component::Linker::new(engine);
+        // 注册 WASI 接口等
+        linker
     }
 
     fn create_instance(
         engine: &wasmtime::Engine,
         component: &wasmtime::component::Component,
+        linker: &wasmtime::component::Linker<WasiState>,
     ) -> Result<WasmInstance> {
         let mut store = wasmtime::Store::new(engine, WasiState::new());
-        let linker = wasmtime::component::Linker::new(engine);
         let instance = linker.instantiate(&mut store, component)?;
         Ok(WasmInstance { store, instance })
     }
 }
 
-/// RAII 守卫：Drop 时自动归还实例到池
+/// RAII 守卫：pooled 实例 Drop 时归还池，temporary 实例 Drop 时直接丢弃
 pub struct PooledInstance {
     instance: Option<WasmInstance>,
-    pool: Arc<ArrayQueue<WasmInstance>>,
+    return_to: Option<Arc<ArrayQueue<WasmInstance>>>,  // None = temporary
 }
 
 impl PooledInstance {
+    fn pooled(instance: WasmInstance, pool: Arc<ArrayQueue<WasmInstance>>) -> Self {
+        Self { instance: Some(instance), return_to: Some(pool) }
+    }
+
+    fn temporary(instance: WasmInstance) -> Self {
+        Self { instance: Some(instance), return_to: None }
+    }
+
     pub fn call_validate(&mut self, command: &[u8]) -> Result<(), String> {
         let inst = self.instance.as_mut().unwrap();
-        // 调用 WASM validate 函数
         call_wasm_func(&mut inst.store, &inst.instance, "validate", command)
     }
 
@@ -120,21 +135,16 @@ impl PooledInstance {
         let inst = self.instance.as_mut().unwrap();
         call_wasm_func_apply(&mut inst.store, &inst.instance, "apply-events", snapshot, events)
     }
-
-    /// 重置实例状态（清理 WASI 资源），使其可安全复用
-    fn reset(&mut self) {
-        if let Some(inst) = self.instance.as_mut() {
-            inst.store.data_mut().reset();
-        }
-    }
 }
 
 impl Drop for PooledInstance {
     fn drop(&mut self) {
         if let Some(mut instance) = self.instance.take() {
             instance.store.data_mut().reset();
-            // 尝试归还池，池满则丢弃
-            let _ = self.pool.push(instance);
+            // 仅 pooled 实例归还池；temporary 实例直接丢弃
+            if let Some(ref pool) = self.return_to {
+                let _ = pool.push(instance);
+            }
         }
     }
 }
@@ -166,11 +176,13 @@ impl WasmPoolManager {
         Ok(Self { pools })
     }
 
-    pub fn acquire(&self, module_name: &str) -> Result<PooledInstance> {
+    /// 异步获取实例（池命中时无开销，池耗尽时在阻塞线程池中创建临时实例）
+    pub async fn acquire(&self, module_name: &str) -> Result<PooledInstance> {
         self.pools
             .get(module_name)
             .ok_or(Error::module_not_found(module_name))?
             .acquire()
+            .await
     }
 
     fn create_optimized_engine() -> wasmtime::Engine {
@@ -178,7 +190,6 @@ impl WasmPoolManager {
         config.wasm_component_model(true);
         config.cranelift_opt_level(wasmtime::OptLevel::Speed);
         config.parallel_compilation(true);
-        // 启用实例复用优化
         config.cranelift_nan_canonicalization(false);
         wasmtime::Engine::new(&config).unwrap()
     }
@@ -222,7 +233,9 @@ impl PoolSizePolicy {
 | 指标 | 无池（每次创建） | 有池（预热复用） |
 |------|-----------------|-----------------|
 | 实例化延迟 | 100-500μs | 0（已预热） |
-| acquire 延迟 | N/A | ~50ns（无锁 pop） |
+| acquire 延迟（池命中） | N/A | ~50ns（无锁 pop） |
+| acquire 延迟（池耗尽） | N/A | 100-500μs（spawn_blocking 创建临时实例） |
+| Linker 创建 | 每次重新创建 | 共享复用（零开销） |
 | 内存占用 | 波动大 | 稳定（池大小 × 实例内存） |
 | GC 压力 | 高（频繁分配释放） | 无 |
 | 单线程 TPS 上限 | ~5,000 | ~200,000 |
@@ -241,14 +254,14 @@ WASM 组件模型保证实例间完全隔离：
 ```
 Virtual Actor 收到命令（已在内存中激活）
     │
-    ├── pool.acquire("inventory")  ← 无锁，~50ns
-    │
-    ├── instance.call_validate(cmd)
+    ├── pool.acquire("inventory").await  ← 池命中时 ~50ns（无锁），池耗尽时 spawn_blocking
     │
     ├── instance.call_handle(state, cmd)
     │
     └── drop(instance)  ← 自动归还池
 ```
+
+注意：validate 已在 Gateway 层前置执行，Actor 内部不再调用 validate。
 
 每个 Virtual Actor 是单线程的，但多个 Virtual Actor 可以并行从同一个池获取实例。
 `ArrayQueue` 是 lock-free 的，多 Actor 并发 acquire/release 无竞争。
@@ -258,7 +271,7 @@ Virtual Actor 收到命令（已在内存中激活）
 ```
 Virtual Actor 激活（从快照+事件恢复）
     │
-    ├── pool.acquire("inventory")
+    ├── pool.acquire("inventory").await
     │
     ├── instance.call_apply_events(snapshot, events)  ← 批量重建状态
     │

@@ -172,7 +172,7 @@ fn build_aggregate_mutation(module: &ModuleInfo, gateway: Arc<CommandGateway>) -
 |------|------------------------|------------------------|
 | Mutation resolver | 直接调用 CommandHandler | Gateway → Runtime → Actor |
 | 并发模型 | spawn_blocking + 乐观锁 | Virtual Actor 串行，无锁 |
-| 响应时间（热） | 事件加载+重建+持久化 | 仅内存操作（刷盘异步） |
+| 响应时间（热） | 事件加载+重建+持久化 | 内存操作 + 同步写 DB（事件已持久化） |
 | 响应时间（冷） | 同上 | 激活延迟（快照恢复） |
 | 背压 | 无（可能 OOM） | Actor 邮箱有界 channel |
 | 内存管理 | 无状态 | 内存预算 + LRU 驱逐 |

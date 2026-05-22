@@ -8,7 +8,9 @@
 package example:inventory;
 
 interface aggregate {
-    /// 参数格式校验（不依赖聚合状态）
+    /// 参数格式校验（不依赖聚合状态，纯格式/范围检查）
+    /// 定位：快速失败层，拦截明显无效的请求，避免加载状态的开销
+    /// 不做：业务规则校验（如"库存不足"），这些由 handle 负责
     /// 输入：序列化的命令数据
     /// 输出：Ok(()) 或错误描述
     /// 性能要求：< 5μs（纯 CPU，无 IO）
@@ -16,13 +18,15 @@ interface aggregate {
 
     /// 批量应用事件，重建聚合状态
     /// 输入：快照状态（空 list 表示初始状态）+ 增量事件列表
-    /// 输出：最新聚合状态
+    /// 输出：最新聚合状态，或错误描述（用于处理损坏事件）
     /// 调用时机：Actor 启动/恢复时（非每次命令）
-    apply-events: func(snapshot: list<u8>, events: list<list<u8>>) -> list<u8>;
+    /// 错误处理：返回 Err 时 Host 会记录错误并停止激活，防止无限崩溃循环
+    apply-events: func(snapshot: list<u8>, events: list<list<u8>>) -> result<list<u8>, string>;
 
     /// 命令处理：基于当前状态决策，产出新事件
     /// 输入：当前聚合状态 + 命令数据
     /// 输出：新领域事件列表 或 业务错误
+    /// 业务校验在此处进行（如"库存不足"、"订单已关闭"等）
     /// 性能要求：< 50μs（纯 CPU，无 IO）
     handle: func(state: list<u8>, command: list<u8>) -> result<list<list<u8>>, string>;
 }
@@ -31,6 +35,16 @@ world inventory-aggregate {
     export aggregate;
 }
 ```
+
+## validate 与 handle 的职责边界
+
+| 层 | 职责 | 示例 | 需要状态？ |
+|----|------|------|-----------|
+| validate | 格式校验、范围检查、必填字段 | "名称不能为空"、"数量必须>0" | 否 |
+| handle | 业务规则、状态依赖的决策 | "库存不足"、"物品已存在" | 是 |
+
+validate 的价值：在不加载聚合状态的情况下快速拒绝格式错误的请求。
+对于冷聚合（需要从快照+事件恢复），validate 可以节省一次完整的激活开销。
 
 ## 高性能设计约束
 
@@ -180,15 +194,17 @@ impl Guest for Component {
         }
     }
 
-    fn apply_events(snapshot: Vec<u8>, events: Vec<Vec<u8>>) -> Vec<u8> {
+    fn apply_events(snapshot: Vec<u8>, events: Vec<Vec<u8>>) -> Result<Vec<u8>, String> {
         let mut state: InventoryState = if snapshot.is_empty() {
             InventoryState::default()
         } else {
-            serde_json::from_slice(&snapshot).unwrap()
+            serde_json::from_slice(&snapshot)
+                .map_err(|e| format!("快照反序列化失败: {e}"))?
         };
 
-        for event_data in events {
-            let event: DomainEvent = serde_json::from_slice(&event_data).unwrap();
+        for (i, event_data) in events.iter().enumerate() {
+            let event: DomainEvent = serde_json::from_slice(event_data)
+                .map_err(|e| format!("事件 #{i} 反序列化失败: {e}"))?;
             match event {
                 DomainEvent::ItemCreated { name, quantity, .. } => {
                     state.name = name;
@@ -201,7 +217,7 @@ impl Guest for Component {
             }
         }
 
-        serde_json::to_vec(&state).unwrap()
+        serde_json::to_vec(&state).map_err(|e| format!("状态序列化失败: {e}"))
     }
 
     fn handle(state: Vec<u8>, command: Vec<u8>) -> Result<Vec<Vec<u8>>, String> {
@@ -257,6 +273,78 @@ impl WasmEngine {
     }
 }
 ```
+
+## Host 侧崩溃循环防护
+
+当 `apply-events` 返回错误（事件数据损坏或格式不兼容）时，Actor 无法激活。
+如果不加防护，每次访问该聚合都会触发激活 → 失败 → 重试的无限循环。
+
+```rust
+const MAX_ACTIVATION_RETRIES: u32 = 3;
+const ACTIVATION_COOLDOWN: Duration = Duration::from_secs(60);
+
+pub struct ActivationFailureTracker {
+    failures: DashMap<String, (u32, Instant)>,
+}
+
+impl ActivationFailureTracker {
+    /// 检查聚合是否因反复激活失败而被标记为损坏
+    pub fn is_corrupted(&self, aggregate_id: &str) -> bool {
+        self.failures.get(aggregate_id)
+            .map(|entry| {
+                let (count, last_attempt) = entry.value();
+                *count >= MAX_ACTIVATION_RETRIES
+                && last_attempt.elapsed() < ACTIVATION_COOLDOWN
+            })
+            .unwrap_or(false)
+    }
+
+    /// 记录一次激活失败
+    pub fn record_failure(&self, aggregate_id: &str) {
+        self.failures
+            .entry(aggregate_id.to_string())
+            .and_modify(|(count, ts)| { *count += 1; *ts = Instant::now(); })
+            .or_insert((1, Instant::now()));
+    }
+
+    /// 激活成功后清除记录
+    pub fn clear(&self, aggregate_id: &str) {
+        self.failures.remove(aggregate_id);
+    }
+}
+```
+
+Host 在激活 Actor 前检查：
+
+```rust
+async fn activate(&self, aggregate_id: &str, module: &str) -> Result<ActorHandle> {
+    if self.failure_tracker.is_corrupted(aggregate_id) {
+        return Err(Error::aggregate_corrupted(
+            aggregate_id,
+            "apply-events 反复失败，聚合可能存在损坏事件，需人工介入"
+        ));
+    }
+
+    match self.try_activate(aggregate_id, module).await {
+        Ok(handle) => {
+            self.failure_tracker.clear(aggregate_id);
+            Ok(handle)
+        }
+        Err(e) => {
+            self.failure_tracker.record_failure(aggregate_id);
+            Err(e)
+        }
+    }
+}
+```
+
+### 损坏聚合的恢复策略
+
+| 方案 | 适用场景 |
+|------|----------|
+| 修复 WASM 组件（兼容旧事件格式） | 组件升级导致的不兼容 |
+| 事件补偿（写入修正事件） | 单个事件数据损坏 |
+| 手动重置快照 + 跳过损坏事件 | 严重损坏，需 DBA 介入 |
 
 ## 接口演进策略
 
