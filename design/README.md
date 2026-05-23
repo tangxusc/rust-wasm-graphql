@@ -14,5 +14,6 @@
 - [event-publishing.md](./event-publishing.md) — 领域事件发布（CDC + Kafka，acks=all）
 - [wasm-instance-pool.md](./wasm-instance-pool.md) — WASM 实例池（预热、无锁获取、pooled/temporary 分离）
 - [wit-conventions.md](./wit-conventions.md) — WASM 组件 WIT 接口约定、崩溃循环防护
+- [multi-command-wit.md](./multi-command-wit.md) — 多命令 WIT 接口设计（命令发现、路由、监控限流）
 - [cluster.md](./cluster.md) — 集群方案（一致性哈希、Lease 防双激活、故障迁移）
 - [projection.md](./projection.md) — 读模型与 Projection（最终一致性、投影重建、监控）

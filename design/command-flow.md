@@ -15,19 +15,22 @@
 Client       GraphQL      Gateway        VirtualActorRuntime     Actor(聚合)       WASM Pool       EventStore
   │              │            │                  │                   │                 │                │
   │── Mutation ─▶│            │                  │                   │                 │                │
+  │  createItem  │            │                  │                   │                 │                │
   │              │── cmd ────▶│                  │                   │                 │                │
+  │              │ (含 command_type              │                   │                 │                │
+  │              │  ="create-item")              │                   │                 │                │
   │              │            │─ 幂等检查 ──────▶│                   │                 │                │
   │              │            │  (bloom+KV)      │                   │                 │                │
   │              │            │                  │                   │                 │                │
-  │              │            │─ validate() ────────────────────────────────────────▶│                │
+  │              │            │─ validate-create-item() ────────────────────────────▶│                │
   │              │            │◀─ Ok ───────────────────────────────────────────────│                │
   │              │            │                  │                   │                 │                │
   │              │            │─ send(agg_id) ──▶│                   │                 │                │
   │              │            │                  │── 查找/激活 Actor ▶│                 │                │
   │              │            │                  │   (透明寻址)       │                 │                │
   │              │            │                  │                   │                 │                │
-  │              │            │                  │                   │─ handle(state) ▶│                │
-  │              │            │                  │                   │◀─ new_events ───│                │
+  │              │            │                  │                   │─ handle-create-item(state) ───▶│
+  │              │            │                  │                   │◀─ new_events ─────────────────│
   │              │            │                  │                   │                 │                │
   │              │            │                  │                   │── persist(同步等待) ────────────▶│
   │              │            │                  │                   │◀── ack(已落盘) ─────────────────│
@@ -39,9 +42,9 @@ Client       GraphQL      Gateway        VirtualActorRuntime     Actor(聚合)  
   │◀── Result ──│◀───────────│◀─────────────────│◀── Ok(version) ──│                 │                │
 ```
 
-关键顺序：**validate（Gateway 前置） → persist → ack → apply locally → 响应客户端**
+关键顺序：**validate-X（Gateway 前置） → persist → ack → apply locally → 响应客户端**
 
-validate 在 Gateway 层前置执行，不依赖聚合状态，冷聚合无需激活即可拒绝格式错误的请求。
+validate-X 在 Gateway 层前置执行，不依赖聚合状态，冷聚合无需激活即可拒绝格式错误的请求。
 事件先落盘，再更新内存状态。即使 apply 过程中崩溃，重新激活时从 DB 重建即可恢复正确状态。
 
 ## Command Gateway（入口层）
@@ -62,9 +65,10 @@ impl CommandGateway {
             }
         }
 
-        // 2. 前置 validate（不依赖聚合状态，避免冷聚合无谓激活）
+        // 2. 前置 validate-X（按命令类型路由，不依赖聚合状态）
+        let validate_fn = format!("validate-{}", command.command_type);
         let mut instance = self.wasm_pool.acquire(&command.module).await?;
-        instance.call_validate(&command.data)?;
+        instance.call_function(&validate_fn, &[command.data.clone()])?;
         drop(instance);
 
         // 3. 透明寻址：运行时自动激活/路由
@@ -285,12 +289,13 @@ impl VirtualActor {
 
     /// 处理单个命令（强一致：持久化后才响应）
     async fn process_command(&mut self, cmd: IncomingCommand) -> Result<CommandResult> {
-        // 注意：validate 已在 Gateway 层前置执行，此处不再重复调用
+        // 注意：validate-X 已在 Gateway 层前置执行，此处不再重复调用
         // 这样冷聚合无需激活即可拒绝格式错误的请求
 
-        // 1. WASM handle（基于内存中的当前状态决策）
+        // 1. WASM handle-X（按命令类型路由，基于内存中的当前状态决策）
+        let handle_fn = format!("handle-{}", cmd.command_type);
         let mut instance = self.wasm_pool.acquire(&self.module_name).await?;
-        let new_events = instance.call_handle(&self.state, &cmd.data)?;
+        let new_events = instance.call_function(&handle_fn, &[self.state.clone(), cmd.data.clone()])?;
         drop(instance);
 
         // 2. 同步持久化到 Event Store（事件 + 幂等键在同一事务中写入）

@@ -121,14 +121,9 @@ impl PooledInstance {
         Self { instance: Some(instance), return_to: None }
     }
 
-    pub fn call_validate(&mut self, command: &[u8]) -> Result<(), String> {
+    pub fn call_function(&mut self, func_name: &str, args: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, String> {
         let inst = self.instance.as_mut().unwrap();
-        call_wasm_func(&mut inst.store, &inst.instance, "validate", command)
-    }
-
-    pub fn call_handle(&mut self, state: &[u8], command: &[u8]) -> Result<Vec<Vec<u8>>, String> {
-        let inst = self.instance.as_mut().unwrap();
-        call_wasm_func_handle(&mut inst.store, &inst.instance, "handle", state, command)
+        call_wasm_func_generic(&mut inst.store, &inst.instance, func_name, args)
     }
 
     pub fn call_apply_events(&mut self, snapshot: &[u8], events: &[&[u8]]) -> Result<Vec<u8>> {
@@ -256,12 +251,12 @@ Virtual Actor 收到命令（已在内存中激活）
     │
     ├── pool.acquire("inventory").await  ← 池命中时 ~50ns（无锁），池耗尽时 spawn_blocking
     │
-    ├── instance.call_handle(state, cmd)
+    ├── instance.call_function("handle-create-item", &[state, cmd])
     │
     └── drop(instance)  ← 自动归还池
 ```
 
-注意：validate 已在 Gateway 层前置执行，Actor 内部不再调用 validate。
+注意：validate-X 已在 Gateway 层前置执行，Actor 内部不再调用 validate。
 
 每个 Virtual Actor 是单线程的，但多个 Virtual Actor 可以并行从同一个池获取实例。
 `ArrayQueue` 是 lock-free 的，多 Actor 并发 acquire/release 无竞争。

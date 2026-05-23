@@ -50,7 +50,7 @@
                    │                        │  休眠: 内存 → 快照 → 释放     │
                    │                        │                               │
                    │                        │  ┌─ WASM Instance Pool ─────┐│
-                   │                        │  │ validate / handle /      ││
+                   │                        │  │ validate-X / handle-X /  ││
                    │                        │  │ apply-events             ││
                    │                        │  └──────────────────────────┘│
                    │                        └────────────┬─────────────────┘

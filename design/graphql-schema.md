@@ -6,18 +6,21 @@
 
 ### WIT 约定
 
-所有聚合组件的命令接口必须包含以下约定字段：
+每个命令通过 `{command-name}-params` record 定义参数结构，Host 通过 WIT 内省自动生成 GraphQL 参数：
 
 ```wit
-// 每个命令的前两个参数为元数据字段
-record create-item-command {
-    command-id: string,       // 幂等键，客户端生成（UUID）
-    aggregate-id: string,     // 聚合根标识
-    // ... 领域参数
+// 参数类型定义（Host 自动读取字段信息生成 GraphQL schema）
+record create-item-params {
     name: string,
     quantity: u32,
 }
+
+record adjust-stock-params {
+    delta: s32,
+}
 ```
+
+`commandId` 和 `aggregateId` 由 Host 自动注入为每个 mutation 的必填参数，无需在 WIT record 中定义。
 
 ### 生成的 GraphQL Schema
 
@@ -103,7 +106,7 @@ pub fn extract_command_meta(
     // 领域参数序列化为 bytes（传递给 WASM）
     let data = serde_json::to_vec(&domain_args)?;
 
-    Ok(IncomingCommand { command_id, aggregate_id, data, module: String::new() })
+    Ok(IncomingCommand { command_id, aggregate_id, data, module: String::new(), command_type: String::new() })
 }
 ```
 
@@ -120,7 +123,7 @@ pub fn build_dynamic_schema(
 
     for module in registry.modules() {
         if module.is_aggregate() {
-            // 聚合模块 → Mutation 字段，命令透明路由到 Virtual Actor
+            // 聚合模块 → Mutation 字段，每个命令生成独立的 mutation field
             let module_obj = build_aggregate_mutation(&module, gateway.clone());
             mutation = mutation.field(/* ... */);
         }
@@ -134,23 +137,27 @@ pub fn build_dynamic_schema(
     Schema::build(query, Some(mutation), None).finish()
 }
 
-/// 聚合模块的 Mutation 字段构建
-fn build_aggregate_mutation(module: &ModuleInfo, gateway: Arc<CommandGateway>) -> Object {
+/// 聚合模块的 Mutation 字段构建（基于 WIT 内省发现的命令列表）
+fn build_aggregate_mutation(module: &WasmEngine, gateway: Arc<CommandGateway>) -> Object {
+    let module_name = module.name().to_string();
     let mut obj = Object::new(format!("{}Mutation", module.pascal_name()));
 
-    for cmd_func in module.command_functions() {
+    for cmd in module.commands() {
         let gateway = gateway.clone();
-        let module_name = module.name().to_string();
+        let module_name = module_name.clone();
+        let command_type = cmd.name.clone();
 
         obj = obj.field(
-            Field::new(cmd_func.graphql_name(), TypeRef::named_nn("CommandResult"), move |ctx| {
+            Field::new(cmd.graphql_name(), TypeRef::named_nn("CommandResult"), move |ctx| {
                 let gateway = gateway.clone();
                 let module_name = module_name.clone();
+                let command_type = command_type.clone();
 
                 FieldFuture::new(async move {
                     let args = ctx.args;
                     let mut command = extract_command_meta(&args)?;
                     command.module = module_name;
+                    command.command_type = command_type;
 
                     // 透明寻址：Gateway → VirtualActorRuntime → Actor
                     let result = gateway.execute(command).await?;
@@ -158,24 +165,15 @@ fn build_aggregate_mutation(module: &ModuleInfo, gateway: Arc<CommandGateway>) -
                     Ok(Some(FieldValue::owned_any(result)))
                 })
             })
-            .arguments(cmd_func.graphql_args())
+            .argument(InputValue::new("commandId", TypeRef::named_nn(TypeRef::STRING)))
+            .argument(InputValue::new("aggregateId", TypeRef::named_nn(TypeRef::STRING)))
+            .arguments(cmd.domain_args_as_graphql())
         );
     }
 
     obj
 }
 ```
-
-### 关键区别：旧方案 vs 新方案
-
-| 维度 | 旧方案（直接调用 WASM） | 新方案（Virtual Actor） |
-|------|------------------------|------------------------|
-| Mutation resolver | 直接调用 CommandHandler | Gateway → Runtime → Actor |
-| 并发模型 | spawn_blocking + 乐观锁 | Virtual Actor 串行，无锁 |
-| 响应时间（热） | 事件加载+重建+持久化 | 内存操作 + 同步写 DB（事件已持久化） |
-| 响应时间（冷） | 同上 | 激活延迟（快照恢复） |
-| 背压 | 无（可能 OOM） | Actor 邮箱有界 channel |
-| 内存管理 | 无状态 | 内存预算 + LRU 驱逐 |
 
 ### 模块类型识别
 
@@ -184,7 +182,7 @@ Host 通过 WIT 内省判断模块类型：
 | 导出接口 | 模块类型 | GraphQL 映射 |
 |----------|----------|-------------|
 | 仅包含普通函数 | 查询模块 | Query 字段 |
-| 包含 `validate` + `apply-events` + `handle` | 聚合模块 | Mutation 字段 |
+| 包含 `validate-X` + `handle-X` 对 + `apply-events` | 聚合模块 | Mutation 字段 |
 | 两者都有 | 混合模块 | Query + Mutation |
 
 ### GraphQL Subscription（事件推送）

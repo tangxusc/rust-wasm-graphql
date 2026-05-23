@@ -9,8 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 开发模式
 
-TDD开发
+TDD开发,e2e测试
 修改代码需同步维护文档
+遵循编程语言最佳实践
 
 ## Build Commands
 
