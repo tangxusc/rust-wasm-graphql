@@ -371,30 +371,36 @@ pub struct InventoryState {
 const MAX_ACTIVATION_RETRIES: u32 = 3;
 const ACTIVATION_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// 使用带 TTL 的缓存追踪激活失败，条目在冷却期后自动过期，防止内存无限增长
 pub struct ActivationFailureTracker {
-    failures: DashMap<String, (u32, Instant)>,
+    /// key: aggregate_id, value: 连续失败次数
+    /// TTL = ACTIVATION_COOLDOWN，过期后自动清除（允许重新尝试激活）
+    failures: moka::sync::Cache<String, u32>,
 }
 
 impl ActivationFailureTracker {
+    pub fn new() -> Self {
+        Self {
+            failures: moka::sync::Cache::builder()
+                .time_to_live(ACTIVATION_COOLDOWN)
+                .max_capacity(100_000)
+                .build(),
+        }
+    }
+
     pub fn is_corrupted(&self, aggregate_id: &str) -> bool {
         self.failures.get(aggregate_id)
-            .map(|entry| {
-                let (count, last_attempt) = entry.value();
-                *count >= MAX_ACTIVATION_RETRIES
-                && last_attempt.elapsed() < ACTIVATION_COOLDOWN
-            })
+            .map(|count| count >= MAX_ACTIVATION_RETRIES)
             .unwrap_or(false)
     }
 
     pub fn record_failure(&self, aggregate_id: &str) {
-        self.failures
-            .entry(aggregate_id.to_string())
-            .and_modify(|(count, ts)| { *count += 1; *ts = Instant::now(); })
-            .or_insert((1, Instant::now()));
+        let count = self.failures.get(aggregate_id).unwrap_or(0);
+        self.failures.insert(aggregate_id.to_string(), count + 1);
     }
 
     pub fn clear(&self, aggregate_id: &str) {
-        self.failures.remove(aggregate_id);
+        self.failures.invalidate(aggregate_id);
     }
 }
 ```

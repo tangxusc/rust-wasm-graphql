@@ -33,6 +33,12 @@ CREATE TABLE idempotency_keys (
 
 -- 幂等键自动过期清理（72 小时）
 CREATE INDEX idx_idempotency_created ON idempotency_keys (created_at);
+
+-- Fencing token 表（集群模式防脑裂双写，单机模式不使用）
+CREATE TABLE aggregate_fencing (
+    aggregate_id    VARCHAR(255) PRIMARY KEY,
+    fencing_token   BIGINT NOT NULL DEFAULT 0
+);
 ```
 
 ## Trait 定义
@@ -136,12 +142,34 @@ impl EventStore for PgEventStore {
         events: &[PendingEvent],
         expected_version: u64,
         command_id: &str,
-        _fencing_token: Option<u64>,
+        fencing_token: Option<u64>,
     ) -> Result<(), StoreError> {
         if events.is_empty() { return Ok(()); }
 
         let mut tx = self.pool.begin().await
             .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+
+        // Fencing token 检查（集群模式防脑裂，单机模式跳过）
+        if let Some(token) = fencing_token {
+            let result = sqlx::query(
+                "INSERT INTO aggregate_fencing (aggregate_id, fencing_token) \
+                 VALUES ($1, $2) \
+                 ON CONFLICT (aggregate_id) DO UPDATE \
+                 SET fencing_token = $2 \
+                 WHERE aggregate_fencing.fencing_token < $2"
+            )
+            .bind(aggregate_id)
+            .bind(token as i64)
+            .execute(&mut *tx).await
+            .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+
+            if result.rows_affected() == 0 {
+                return Err(StoreError::FencingTokenExpired {
+                    aggregate_id: aggregate_id.to_string(),
+                    provided_token: token,
+                });
+            }
+        }
 
         // 写入幂等键（ON CONFLICT 检测重复命令）
         let inserted = sqlx::query(

@@ -188,7 +188,7 @@ impl WasmPoolManager {
         Ok(Self { pools })
     }
 
-    /// 异步获取实例（池命中时无开销，池耗尽时在阻塞线程池中创建临时实例）
+    /// 异步获取实例（池命中时无开销，池耗尽时返回错误触发上层背压）
     pub async fn acquire(&self, module_name: &str) -> Result<PooledInstance> {
         self.pools
             .get(module_name)

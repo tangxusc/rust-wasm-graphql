@@ -712,20 +712,23 @@ impl VirtualActorRuntime {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        // 阶段 2：通知所有 Actor 休眠（保存快照）
+        // 阶段 2：通知所有 Actor 休眠并收集退出信号
         let handles: Vec<(String, ActorHandle)> = self.active.iter()
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
 
+        let mut exit_receivers = Vec::with_capacity(handles.len());
         for (_, handle) in &handles {
-            handle.send_deactivate().await;
+            let rx = handle.send_deactivate_and_wait().await;
+            exit_receivers.push(rx);
         }
 
-        // 阶段 3：等待所有 Actor 退出
-        let extra_deadline = Instant::now() + Duration::from_secs(10);
-        while !self.active.is_empty() && Instant::now() < extra_deadline {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        // 阶段 3：并行等待所有 Actor 退出（带超时保护）
+        let extra_timeout = Duration::from_secs(10);
+        let _ = tokio::time::timeout(
+            extra_timeout,
+            futures::future::join_all(exit_receivers),
+        ).await;
 
         if !self.active.is_empty() {
             tracing::warn!(
@@ -845,6 +848,23 @@ pub struct BackpressureConfig {
 | GraphQL | 请求超时 > request_timeout | 504 Gateway Timeout | 重试（带退避） |
 | Gateway | semaphore 等待 > queue_timeout | 503 Service Unavailable | 重试（带退避） |
 | Actor | mailbox try_send 失败 | 503 Actor 邮箱已满 | 重试（带退避） |
+
+### validate 前置执行的设计权衡
+
+**现状**：validate 在 Gateway 层（Semaphore 通过后、Actor mailbox 之前）执行。
+如果 Actor mailbox 满，请求在 validate 之后被拒绝，validate 的计算资源被"浪费"。
+
+**为什么仍然选择前置执行**：
+
+| 考量 | 说明 |
+|------|------|
+| 避免冷聚合激活 | validate 失败时无需激活 Actor（节省快照恢复开销 ~50ms） |
+| 快速拒绝无效请求 | 格式错误的请求在 Gateway 层即被拦截，不占用 Actor mailbox 槽位 |
+| 资源浪费有限 | mailbox 满是过载信号，此时 validate 的 WASM 调用（~10μs）远小于整体延迟 |
+| Semaphore 已限流 | `max_concurrent_commands` 限制了同时执行 validate 的请求数 |
+
+**配置建议**：`max_concurrent_commands` 应设置为接近 Actor mailbox 总容量
+（`max_active × mailbox_capacity`）的量级，避免大量请求通过 Semaphore 后在 mailbox 处堆积。
 
 ### 客户端退避建议
 

@@ -535,3 +535,113 @@ pub enum RateLimitStrategy {
     Centralized(RedisPool),   // Redis 集中式（精确，+1-2ms）
 }
 ```
+
+## ClusterVirtualActorRuntime（集群模式包装层）
+
+单机模式的 `VirtualActorRuntime` 不感知 lease，集群模式通过包装层在外层处理 lease 获取和 fencing token 设置，
+明确两种模式的集成路径。
+
+```rust
+/// 集群模式包装层：在单机 VirtualActorRuntime 外层处理 lease 和路由
+pub struct ClusterVirtualActorRuntime {
+    inner: Arc<VirtualActorRuntime>,
+    lease_manager: Arc<ActorLease>,
+    /// aggregate_id → LeaseGuard（活跃 Actor 持有的 lease）
+    active_leases: DashMap<String, Arc<LeaseGuard>>,
+}
+
+impl ClusterVirtualActorRuntime {
+    /// 集群模式的透明寻址：获取 lease → 激活 Actor → 设置 fencing token
+    pub async fn send(
+        &self,
+        aggregate_id: &str,
+        command: IncomingCommand,
+    ) -> Result<CommandResult> {
+        // 1. 确保持有该聚合的 lease
+        let lease_guard = self.ensure_lease(aggregate_id).await?;
+
+        // 2. 检查 lease 是否仍然有效（续约未失败）
+        if !lease_guard.is_valid() {
+            self.active_leases.remove(aggregate_id);
+            return Err(Error::lease_expired("Lease 已失效，请重试"));
+        }
+
+        // 3. 委托给内部 Runtime 处理（Actor 内部使用 fencing_token 写入 Event Store）
+        self.inner.send(aggregate_id, command).await
+    }
+
+    /// 确保持有聚合的 lease（已持有则复用，未持有则获取）
+    async fn ensure_lease(&self, aggregate_id: &str) -> Result<Arc<LeaseGuard>> {
+        if let Some(guard) = self.active_leases.get(aggregate_id) {
+            if guard.is_valid() {
+                return Ok(guard.clone());
+            }
+            // lease 已失效，移除并重新获取
+            drop(guard);
+            self.active_leases.remove(aggregate_id);
+        }
+
+        // 获取新 lease
+        let guard = Arc::new(
+            self.lease_manager.acquire_for(aggregate_id).await?
+        );
+        self.active_leases.insert(aggregate_id.to_string(), guard.clone());
+        Ok(guard)
+    }
+
+    /// Actor 激活时的扩展：设置 fencing_token 到 Actor 实例
+    /// 由 VirtualActorRuntime 的 activate 回调触发
+    pub fn on_actor_activated(&self, aggregate_id: &str, actor: &mut VirtualActor) {
+        if let Some(guard) = self.active_leases.get(aggregate_id) {
+            actor.fencing_token = Some(guard.fencing_token());
+        }
+    }
+
+    /// Actor 休眠时释放 lease
+    pub async fn on_actor_deactivated(&self, aggregate_id: &str) {
+        if let Some((_, guard)) = self.active_leases.remove(aggregate_id) {
+            // LeaseGuard Drop 时自动释放 lease
+            drop(guard);
+        }
+    }
+}
+```
+
+### 单机模式与集群模式的切换
+
+```rust
+/// 统一的 ActorRuntime trait，上层代码无需感知部署模式
+#[async_trait]
+pub trait ActorRuntime: Send + Sync {
+    async fn send(&self, aggregate_id: &str, command: IncomingCommand) -> Result<CommandResult>;
+    async fn graceful_shutdown(&self, timeout: Duration);
+}
+
+/// 单机模式：直接使用 VirtualActorRuntime
+impl ActorRuntime for VirtualActorRuntime { /* ... */ }
+
+/// 集群模式：通过 ClusterVirtualActorRuntime 包装
+impl ActorRuntime for ClusterVirtualActorRuntime { /* ... */ }
+
+/// 启动时根据配置选择模式
+pub fn create_runtime(config: &AppConfig) -> Arc<dyn ActorRuntime> {
+    if let Some(cluster_config) = &config.cluster {
+        Arc::new(ClusterVirtualActorRuntime::new(
+            config.actor_config.clone(),
+            cluster_config.clone(),
+        ))
+    } else {
+        Arc::new(VirtualActorRuntime::new(config.actor_config.clone()))
+    }
+}
+```
+
+### 集成路径说明
+
+| 组件 | 单机模式 | 集群模式 |
+|------|----------|----------|
+| Gateway | `VirtualActorRuntime::send()` | `ClusterVirtualActorRuntime::send()` |
+| Actor 激活 | 直接从快照+事件恢复 | 先获取 lease → 恢复 → 设置 fencing_token |
+| Actor 休眠 | 保存快照 | 保存快照 → 释放 lease |
+| Event Store 写入 | `fencing_token = None` | `fencing_token = Some(token)` |
+| Actor 崩溃恢复 | 下次访问自动重新激活 | 重新获取 lease → 重新激活 |

@@ -101,21 +101,24 @@ async fn admin_reload(
     ├── 3. 创建新实例池（预热）
     │      - 新池与旧池并存
     │
-    ├── 4. 原子切换 WasmPoolManager 中的模块引用
-    │      - 新请求使用新池
-    │      - 旧池中正在使用的实例继续完成当前调用
+    ├── 4. 休眠该类型所有活跃 Actor
+    │      - 发送 Deactivate，等待退出
+    │      - 确保无旧 Actor 使用新池（消除新旧版本混合处理窗口）
     │
     ├── 5. 清除该聚合类型的所有快照
     │      - 下次激活时从事件全量重建
     │
-    ├── 6. 休眠该类型所有活跃 Actor
-    │      - 发送 Deactivate，等待退出
-    │      - 下次访问时用新组件重新激活
+    ├── 6. 原子切换 WasmPoolManager 中的模块引用
+    │      - 新请求使用新池
+    │      - 旧池中正在使用的实例继续完成当前调用（此时应已无活跃调用）
     │
     ├── 7. 等待旧池所有实例归还后释放
     │
     └── 8. 更新 GraphQL schema（如果命令列表变化）
 ```
+
+> **设计说明**：步骤 4（休眠）在步骤 6（切换池）之前执行，确保不存在"旧 Actor 内存状态 + 新池实例"
+> 的混合处理窗口。旧 Actor 休眠后，新请求到达时会用新池重新激活，状态从事件全量重建，保证一致性。
 
 ### 实现
 
@@ -136,14 +139,14 @@ impl HotReloadWatcher {
             self.pool_size,
         )?;
 
-        // 3. 原子切换（旧池引用计数归零后自动释放）
+        // 3. 先休眠所有该类型 Actor（消除新旧版本混合处理窗口）
+        self.actor_runtime.on_module_upgrade(&module_name).await?;
+
+        // 4. 原子切换池（此时无活跃 Actor 使用旧池）
         {
             let mut manager = self.pool_manager.write().await;
             manager.replace_pool(&module_name, Arc::new(new_pool));
         }
-
-        // 4. 清除快照 + 休眠 Actor
-        self.actor_runtime.on_module_upgrade(&module_name).await?;
 
         // 5. 更新 GraphQL schema（如果需要）
         self.maybe_rebuild_schema(&module_name).await?;
@@ -303,6 +306,66 @@ impl CanaryDeployment {
             to_migrate.len(),
             runtime.active_count(&self.module_name) 
         );
+    }
+}
+```
+
+### 灰度比例动态调整
+
+当灰度比例从 `old_ratio` 调整到 `new_ratio`（`new_ratio > old_ratio`）时，
+新进入灰度范围的活跃聚合需要迁移到新版本：
+
+```rust
+impl CanaryDeployment {
+    /// 调整灰度比例，自动迁移新进入范围的聚合
+    pub async fn adjust_ratio(
+        &mut self,
+        new_ratio: f64,
+        runtime: &VirtualActorRuntime,
+    ) {
+        let old_ratio = self.config.traffic_ratio;
+        self.config.traffic_ratio = new_ratio;
+
+        if new_ratio > old_ratio {
+            // 比例增大：新进入灰度范围的聚合需要迁移
+            let newly_in_range: Vec<String> = runtime
+                .active_aggregates(&self.module_name)
+                .filter(|agg_id| {
+                    let hash_ratio = hash_aggregate_id(agg_id) as f64 / u64::MAX as f64;
+                    // 之前不在范围内，现在在范围内
+                    hash_ratio >= old_ratio && hash_ratio < new_ratio
+                })
+                .collect();
+
+            for agg_id in &newly_in_range {
+                runtime.deactivate(agg_id).await;
+                runtime.snapshot_store.delete(&self.module_name, agg_id).await.ok();
+            }
+
+            tracing::info!(
+                "灰度比例 {:.0}% → {:.0}%：{} 个聚合迁移到新版本",
+                old_ratio * 100.0, new_ratio * 100.0, newly_in_range.len()
+            );
+        } else if new_ratio < old_ratio {
+            // 比例缩小：退出灰度范围的聚合迁移回旧版本
+            let exiting_range: Vec<String> = runtime
+                .active_aggregates(&self.module_name)
+                .filter(|agg_id| {
+                    let hash_ratio = hash_aggregate_id(agg_id) as f64 / u64::MAX as f64;
+                    hash_ratio >= new_ratio && hash_ratio < old_ratio
+                })
+                .collect();
+
+            for agg_id in &exiting_range {
+                runtime.deactivate(agg_id).await;
+                runtime.snapshot_store.delete(&self.module_name, agg_id).await.ok();
+            }
+
+            tracing::info!(
+                "灰度比例 {:.0}% → {:.0}%：{} 个聚合回退到旧版本",
+                old_ratio * 100.0, new_ratio * 100.0, exiting_range.len()
+            );
+        }
     }
 }
 ```
