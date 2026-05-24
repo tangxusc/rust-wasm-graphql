@@ -6,27 +6,9 @@
 - **零额外写入**：无需 outbox 表，事件写入 events 表即自动触发发布
 - **更低延迟**：WAL 监听延迟 < 10ms，远优于轮询模式的 poll_interval
 
-## 架构对比
-
-### 旧方案：Outbox 轮询
-
-```
-写入 events + outbox (同事务) → 轮询 outbox → 发送 Kafka → 标记 published
-延迟：poll_interval (100ms-1s)
-额外写入：每事件 2 次 INSERT
-```
-
-### 新方案：CDC (Change Data Capture)
-
-```
-写入 events → PostgreSQL WAL → Debezium/自研 CDC → Kafka
-延迟：< 10ms
-额外写入：0
-```
-
 ## CDC 实现方案
 
-### 方案 A：Debezium（推荐生产环境）
+### Debezium（推荐生产环境）
 
 ```yaml
 # Debezium connector 配置
@@ -47,85 +29,6 @@
     "transforms.route.topic.regex": "(.*)events(.*)",
     "transforms.route.topic.replacement": "domain.events.$1"
   }
-}
-```
-
-### 方案 B：自研 WAL 监听（轻量级/嵌入式）
-
-```rust
-use tokio_postgres::replication::LogicalReplicationStream;
-
-pub struct WalListener {
-    slot_name: String,
-    publication: String,
-    kafka_producer: Arc<KafkaPublisher>,
-    connect_config: tokio_postgres::Config,
-    max_retries: u32,
-    base_backoff: Duration,
-}
-
-impl WalListener {
-    pub async fn run(&self) -> ! {
-        let mut consecutive_failures = 0u32;
-
-        loop {
-            match self.run_stream().await {
-                Ok(()) => {
-                    // stream 正常结束（不应发生），重置计数器后重连
-                    consecutive_failures = 0;
-                    tracing::warn!("WAL stream 意外结束，立即重连");
-                }
-                Err(e) => {
-                    consecutive_failures += 1;
-                    let backoff = self.calculate_backoff(consecutive_failures);
-                    tracing::error!(
-                        "WAL 监听失败 (连续第 {consecutive_failures} 次): {e}, \
-                         {backoff:?} 后重试"
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
-    }
-
-    /// 指数退避：base * 2^(failures-1)，上限 60s
-    fn calculate_backoff(&self, failures: u32) -> Duration {
-        let multiplier = 2u64.pow((failures - 1).min(6));
-        let backoff = self.base_backoff * multiplier as u32;
-        backoff.min(Duration::from_secs(60))
-    }
-
-    async fn run_stream(&self) -> Result<()> {
-        let (client, connection) = self.connect_config.connect(tokio_postgres::NoTls).await?;
-        tokio::spawn(connection);
-
-        let stream = client
-            .copy_both_simple::<bytes::Bytes>(&format!(
-                "START_REPLICATION SLOT {} LOGICAL 0/0 (proto_version '1', publication_names '{}')",
-                self.slot_name, self.publication
-            ))
-            .await?;
-
-        let mut stream = LogicalReplicationStream::new(stream);
-
-        while let Some(msg) = stream.next().await {
-            match msg? {
-                ReplicationMessage::XLogData(data) => {
-                    let events = self.parse_wal_events(&data.data())?;
-                    self.kafka_producer.publish(&events).await?;
-                    let lsn = data.wal_end();
-                    stream.standby_status_update(lsn, lsn, PgLsn::from(0), 0, 0).await?;
-                }
-                ReplicationMessage::PrimaryKeepAlive(ka) if ka.reply() == 1 => {
-                    let lsn = ka.wal_end();
-                    stream.standby_status_update(lsn, lsn, PgLsn::from(0), 0, 0).await?;
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
-    }
 }
 ```
 
@@ -161,45 +64,6 @@ domain.events.{aggregate_type}
     "timestamp": "1716278400000"
   },
   "value": "<序列化的事件数据 bytes>"
-}
-```
-
-## Fallback：Outbox 模式（CDC 不可用时）
-
-如果部署环境无法使用 CDC（如 SQLite 本地开发），退回 Outbox 轮询：
-
-```rust
-pub struct OutboxRelay {
-    event_store: Arc<dyn EventStoreShard>,
-    publisher: Arc<dyn EventPublisher>,
-    poll_interval: Duration,        // 50-100ms
-    batch_size: usize,              // 500
-}
-
-impl OutboxRelay {
-    pub async fn run(&self) -> ! {
-        loop {
-            match self.process_batch().await {
-                Ok(count) if count > 0 => continue,
-                Ok(_) => tokio::time::sleep(self.poll_interval).await,
-                Err(e) => {
-                    tracing::error!("Outbox relay 错误: {e}");
-                    tokio::time::sleep(self.poll_interval).await;
-                }
-            }
-        }
-    }
-
-    async fn process_batch(&self) -> Result<usize> {
-        let unpublished = self.event_store.fetch_unpublished(self.batch_size).await?;
-        let count = unpublished.len();
-        if count == 0 { return Ok(0); }
-
-        self.publisher.publish(&unpublished).await?;
-        let ids: Vec<i64> = unpublished.iter().map(|e| e.id).collect();
-        self.event_store.mark_published_batch(&ids).await?;
-        Ok(count)
-    }
 }
 ```
 
@@ -333,10 +197,10 @@ pub trait Projection: Send + Sync {
 
 ## 性能指标
 
-| 指标 | CDC 模式 | Outbox 轮询模式 |
-|------|----------|----------------|
-| 发布延迟 | < 10ms | 50-1000ms |
-| 额外写入 IO | 0 | 1x (outbox INSERT) |
-| 吞吐上限 | WAL 带宽限制 (~100K/s) | 轮询频率限制 |
-| 运维复杂度 | 中（需管理 replication slot） | 低 |
-| 数据一致性 | 强（WAL 保证） | 强（同事务） |
+| 指标 | CDC 模式 |
+|------|----------|
+| 发布延迟 | < 10ms |
+| 额外写入 IO | 0 |
+| 吞吐上限 | WAL 带宽限制 (~100K/s) |
+| 运维复杂度 | 中（需管理 replication slot） |
+| 数据一致性 | 强（WAL 保证） |
