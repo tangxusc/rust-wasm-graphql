@@ -238,17 +238,17 @@ Lease 过期（节点故障）:
 原因：validate 是无状态的纯格式校验（不依赖聚合状态），在任何节点执行结果相同。
 重复执行只会浪费 WASM 实例池资源。
 
-实现：转发请求时携带 `validated: true` 标记，owner 节点收到已验证的请求后跳过 validate：
+**滚动升级安全**：转发时携带源节点的组件版本哈希。owner 节点收到请求后检查版本是否一致，
+不一致时重新执行 validate（防止滚动升级期间新旧版本校验逻辑差异导致的问题）。
+
+实现：转发请求时携带 `validated: true` 和 `module_version` 标记。
+
+> **IncomingCommand 权威定义**见 [command-flow.md](./command-flow.md#incomingcommand-结构统一定义)。
+> 集群模式扩展字段：
 
 ```rust
-pub struct IncomingCommand {
-    pub command_id: String,
-    pub aggregate_id: String,
-    pub module: String,
-    pub command_type: String,
-    pub data: Vec<u8>,
-    pub validated: bool,  // true = validate 已在源节点执行，owner 节点跳过
-}
+// 集群模式扩展（追加到 IncomingCommand）
+pub module_version: Option<String>,  // 源节点的组件版本哈希（仅集群模式转发时填充）
 ```
 
 ### 方案：客户端侧路由（推荐）
@@ -262,6 +262,16 @@ impl ClusterGateway {
 
         if target_node == self.local_node_id {
             // 本地处理（走完整 Gateway 流程）
+            // 如果是转发来的请求，检查版本一致性
+            if command.validated {
+                if let Some(ref source_version) = command.module_version {
+                    let local_version = self.module_versions.get(&command.module);
+                    if local_version.as_deref() != Some(source_version.as_str()) {
+                        // 版本不一致（滚动升级中），重新执行 validate
+                        command.validated = false;
+                    }
+                }
+            }
             self.local_gateway.execute(command).await
         } else {
             // 本地先执行 validate（如果有且尚未执行）
@@ -273,10 +283,31 @@ impl ClusterGateway {
                     drop(instance);
                 }
                 command.validated = true;
+                command.module_version = self.module_versions.get(&command.module).cloned();
             }
-            // 转发到目标节点（gRPC），owner 节点收到后跳过 validate
+            // 转发到目标节点（gRPC），owner 节点版本一致时跳过 validate
             self.forward_to(target_node, command).await
         }
+    }
+}
+```
+
+### 组件版本哈希
+
+启动时或热更新后，对每个 WASM 组件计算内容哈希作为版本标识：
+
+```rust
+pub struct ClusterGateway {
+    // ...
+    /// 模块名 → 组件内容 SHA-256 前 16 字节 hex
+    module_versions: HashMap<String, String>,
+}
+
+impl ClusterGateway {
+    fn compute_module_version(wasm_bytes: &[u8]) -> String {
+        use sha2::{Sha256, Digest};
+        let hash = Sha256::digest(wasm_bytes);
+        hex::encode(&hash[..16])
     }
 }
 ```

@@ -239,13 +239,30 @@ impl RollingBloomFilter {
         inner.current.insert(command_id);
         inner.inserted += 1;
         if inner.inserted >= inner.rotate_threshold {
-            let new_filter = BloomFilter::with_rate(
-                self.false_positive_rate, self.capacity
-            );
-            let old_current = std::mem::replace(&mut inner.current, new_filter);
-            inner.previous = old_current;
-            inner.inserted = 0;
+            self.rotate_inner(&mut inner);
         }
+    }
+
+    /// 预热专用：仅插入不计数、不触发 rotate
+    /// 预热完成后调用 finalize_warm_up 设置正确的 inserted 计数
+    fn insert_no_rotate(&self, command_id: &str) {
+        let mut inner = self.inner.write();
+        inner.current.insert(command_id);
+    }
+
+    /// 预热完成后设置 inserted 计数（用于后续正常 insert 时正确触发 rotate）
+    fn finalize_warm_up(&self, loaded_count: usize) {
+        let mut inner = self.inner.write();
+        inner.inserted = loaded_count % inner.rotate_threshold;
+    }
+
+    fn rotate_inner(&self, inner: &mut BloomFilterInner) {
+        let new_filter = BloomFilter::with_rate(
+            self.false_positive_rate, self.capacity
+        );
+        let old_current = std::mem::replace(&mut inner.current, new_filter);
+        inner.previous = old_current;
+        inner.inserted = 0;
     }
 }
 ```
@@ -270,7 +287,7 @@ impl RollingBloomFilter {
 
 ```rust
 impl RollingBloomFilter {
-    /// 启动时从 DB 预热布隆过滤器
+    /// 启动时从 DB 预热布隆过滤器（使用 insert_no_rotate 避免预热过程中触发 rotate）
     pub async fn warm_up(
         &self,
         pool: &PgPool,
@@ -298,13 +315,16 @@ impl RollingBloomFilter {
             if keys.is_empty() { break; }
 
             for key in &keys {
-                self.insert(key);
+                self.insert_no_rotate(key);
             }
             cursor = keys.last().unwrap().clone();
             total += keys.len();
 
             if keys.len() < batch_size { break; }
         }
+
+        // 预热完成后设置正确的 inserted 计数，确保后续 insert 能正确触发 rotate
+        self.finalize_warm_up(total);
 
         tracing::info!("布隆过滤器预热完成，加载 {} 个幂等键", total);
         Ok(total)

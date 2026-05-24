@@ -166,35 +166,8 @@ impl WasmEngine {
 
 ### Gateway 层路由
 
-Gateway 收到 GraphQL mutation 请求时，已知命令类型（从 GraphQL field name 反推）：
-
-> **注意**：以下为简化版 Gateway 代码，仅展示命令路由逻辑。
-> 完整流程（含幂等检查、关闭检查、布隆过滤器）见 [command-flow.md](./command-flow.md)。
-
-```rust
-pub struct CommandGateway {
-    runtime: Arc<VirtualActorRuntime>,
-    wasm_pool: Arc<WasmPoolManager>,
-    command_registry: CommandRegistry,  // 启动时缓存的命令定义
-}
-
-impl CommandGateway {
-    pub async fn execute(&self, command: IncomingCommand) -> Result<CommandResult> {
-        // 1. 前置 validate（仅当该命令有 validate 函数时执行）
-        let cmd_def = self.command_registry.get(&command.module, &command.command_type);
-        if let Some(validate_fn) = cmd_def.and_then(|c| c.validate_fn.as_ref()) {
-            let mut instance = self.wasm_pool.acquire(&command.module).await?;
-            instance.call_validate(validate_fn, &command.data)?;
-            drop(instance);
-        }
-        // 无 validate 函数时：直接跳过，进入 Actor 处理
-
-        // 2. 透明寻址到 Virtual Actor
-        let result = self.runtime.send(&command.aggregate_id, command).await?;
-        Ok(result)
-    }
-}
-```
+Gateway 收到 GraphQL mutation 请求时，已知命令类型（从 GraphQL field name 反推）。
+完整 Gateway 流程（含幂等检查、关闭检查、布隆过滤器、validate 前置）见 [command-flow.md](./command-flow.md#command-gateway入口层)。
 
 ### Actor 内命令处理
 
@@ -218,18 +191,9 @@ impl VirtualActor {
 }
 ```
 
-### IncomingCommand 结构（更新）
+### IncomingCommand 结构
 
-```rust
-pub struct IncomingCommand {
-    pub command_id: String,      // 幂等键
-    pub aggregate_id: String,    // 聚合根 ID
-    pub module: String,          // 模块名（如 "inventory"）
-    pub command_type: String,    // 命令类型 kebab-case（如 "create-item"）
-    pub data: Vec<u8>,           // 序列化的命令参数
-    pub validated: bool,         // 集群模式：true 表示 validate 已在源节点执行，owner 节点跳过
-}
-```
+> **权威定义**见 [command-flow.md](./command-flow.md#incomingcommand-结构统一定义)。
 
 ## GraphQL Schema 自动生成
 

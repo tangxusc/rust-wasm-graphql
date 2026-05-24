@@ -131,7 +131,8 @@ impl VirtualActor {
 
         if self.policy.enabled && events_since >= self.policy.threshold {
             // 乐观更新：先设置为当前版本，防止后续命令重复触发快照
-            self.last_snapshot_version.store(self.version, Ordering::Relaxed);
+            let snapshot_version = self.version;
+            self.last_snapshot_version.store(snapshot_version, Ordering::Relaxed);
             let snapshot = Snapshot {
                 aggregate_id: self.aggregate_id.clone(),
                 aggregate_type: self.module_name.clone(),
@@ -140,13 +141,17 @@ impl VirtualActor {
                 created_at: now_millis(),
             };
             let store = self.snapshot_store.clone();
-            let version_before = self.version;
             let last_snapshot_version = self.last_snapshot_version.clone();
             tokio::spawn(async move {
                 if let Err(e) = store.save(&snapshot).await {
                     tracing::warn!("快照保存失败: {e}");
-                    // 保存失败：回退版本，下次命令会重新尝试快照
-                    last_snapshot_version.store(version_before - 1, Ordering::Relaxed);
+                    // 保存失败：仅当值未被后续快照更新时才回退（CAS 防止 ABA）
+                    let _ = last_snapshot_version.compare_exchange(
+                        snapshot_version,
+                        last,  // 回退到本次快照之前的版本
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
                 }
             });
         }

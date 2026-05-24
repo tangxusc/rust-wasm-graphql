@@ -16,3 +16,5 @@
 - [wit-conventions.md](./wit-conventions.md) — WASM 组件 WIT 接口约定、崩溃循环防护
 - [multi-command-wit.md](./multi-command-wit.md) — 多命令 WIT 接口设计（命令发现、路由、监控限流）
 - [cluster.md](./cluster.md) — 集群方案（一致性哈希、Lease 防双激活、故障迁移）
+- [observability.md](./observability.md) — 可观测性设计（OpenTelemetry、指标、追踪、健康检查）
+- [hot-reload.md](./hot-reload.md) — WASM 组件热更新（文件监听、灰度发布、回滚机制）

@@ -238,15 +238,12 @@ impl VirtualActorRuntime {
     }
 
     /// LRU 驱逐（带保护：不驱逐有待处理消息或刚活跃的 Actor）
-    /// 返回 true 表示成功发起了一个 Actor 的驱逐，false 表示无可驱逐候选者
+    /// 返回 true 表示成功驱逐了一个 Actor（已等待其退出），false 表示无可驱逐候选者
     ///
-    /// 安全性说明：evict_one 仅发送 Deactivate 消息，不从 active 中移除。
+    /// 安全性说明：evict_one 发送 Deactivate 并通过 exit_rx 同步等待 Actor 退出。
     /// Actor 处理完 mailbox 中所有待处理命令后收到 Deactivate，保存快照并退出，
-    /// 退出时通过 tokio::spawn 中的 remove_if 自动从 active 中清理。
-    /// 这消除了"先 remove 后 Deactivate"的竞态窗口，确保排队消息不会丢失。
-    ///
-    /// 注意：已发送 Deactivate 但尚未退出的 Actor 仍占用 active 槽位。
-    /// activate() 中的内存压力检查需要考虑这一点（短暂等待或增加少量余量）。
+    /// 退出时通过 exit_tx 通知驱逐方，驱逐方确认后从 active 中移除。
+    /// 同步等待确保 activate() 中的 active.len() 检查准确反映可用槽位。
     async fn evict_one(&self) -> bool {
         let now = now_millis();
         let min_idle_ms = self.min_evict_idle.as_millis() as u64;
@@ -254,8 +251,8 @@ impl VirtualActorRuntime {
         let candidate = self.active.iter()
             .filter(|entry| {
                 let handle = entry.value();
-                // 保护条件：有待处理消息的 Actor 不可驱逐
-                !handle.has_pending_messages()
+                // 保护条件：正在处理消息或有待处理消息的 Actor 不可驱逐
+                !handle.is_busy()
                 // 保护条件：未达到最小空闲时间的 Actor 不可驱逐
                 && (now - handle.last_active()) > min_idle_ms
             })
@@ -263,12 +260,17 @@ impl VirtualActorRuntime {
             .map(|entry| entry.key().clone());
 
         if let Some(id) = candidate {
-            // 仅发送 Deactivate，不从 active 中移除
-            // Actor 处理完 mailbox 后收到 Deactivate，自行保存快照并退出
-            // 退出时 tokio::spawn 中的 remove_if 自动清理 active 条目
             if let Some(handle) = self.active.get(&id) {
-                handle.send_deactivate().await;
+                // 发送 Deactivate 并同步等待 Actor 退出
+                let exit_rx = handle.send_deactivate_and_wait().await;
+                // 等待 Actor 完成快照保存并退出（带超时保护）
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    exit_rx,
+                ).await;
             }
+            // Actor 已退出，从 active 中移除
+            self.active.remove(&id);
             true
         } else {
             false
@@ -309,11 +311,14 @@ impl VirtualActor {
                     self.handle.touch();
                     match msg {
                         ActorMessage::Command { command, reply_tx } => {
+                            self.handle.set_processing(true);
                             let result = self.process_command(command).await;
+                            self.handle.set_processing(false);
                             let _ = reply_tx.send(result);
                         }
                         ActorMessage::Deactivate => {
                             self.on_deactivate().await;
+                            self.handle.notify_exit().await;
                             return;
                         }
                     }
@@ -322,6 +327,7 @@ impl VirtualActor {
                     let idle_ms = now_millis() - self.handle.last_active();
                     if idle_ms > self.idle_timeout.as_millis() as u64 {
                         self.on_deactivate().await;
+                        self.handle.notify_exit().await;
                         return;
                     }
                 }
@@ -394,13 +400,14 @@ impl VirtualActor {
     }
 
     /// 快照判断（异步，不阻塞响应）
-    /// 使用 Arc<AtomicU64> 统一管理快照版本，spawn 任务失败时可安全回退
+    /// 使用 Arc<AtomicU64> 统一管理快照版本，spawn 任务失败时通过 CAS 安全回退
     fn maybe_snapshot(&self) {
         let last = self.last_snapshot_version.load(Ordering::Relaxed);
         let events_since = self.version - last;
         if events_since >= self.snapshot_threshold {
             // 乐观更新：先设置为当前版本，防止后续命令重复触发快照
-            self.last_snapshot_version.store(self.version, Ordering::Relaxed);
+            let snapshot_version = self.version;
+            self.last_snapshot_version.store(snapshot_version, Ordering::Relaxed);
             let snapshot = Snapshot {
                 aggregate_id: self.aggregate_id.clone(),
                 aggregate_type: self.module_name.clone(),
@@ -409,12 +416,16 @@ impl VirtualActor {
                 created_at: now_millis(),
             };
             let store = self.snapshot_store.clone();
-            let version_before = self.version;
             let last_snapshot_version = self.last_snapshot_version.clone();
             tokio::spawn(async move {
                 if store.save(&snapshot).await.is_err() {
-                    // 保存失败：回退版本，下次命令会重新尝试快照
-                    last_snapshot_version.store(version_before - 1, Ordering::Relaxed);
+                    // 保存失败：仅当值未被后续快照更新时才回退（CAS 防止 ABA）
+                    let _ = last_snapshot_version.compare_exchange(
+                        snapshot_version,
+                        last,  // 回退到本次快照之前的版本
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
                 }
             });
         }
@@ -446,6 +457,7 @@ impl VirtualActor {
 
 ```rust
 /// 入站命令（所有文档中 IncomingCommand 的权威定义）
+/// 其他文档引用此定义，不再重复。
 pub struct IncomingCommand {
     pub command_id: String,      // 幂等键（全局唯一）
     pub aggregate_id: String,    // 聚合根 ID
@@ -455,6 +467,9 @@ pub struct IncomingCommand {
     pub validated: bool,         // 集群模式：true 表示 validate 已在源节点执行，
                                  // owner 节点跳过（详见 cluster.md）
                                  // 单机模式：始终为 false
+    pub module_version: Option<String>,  // 集群模式：源节点的组件版本哈希，
+                                         // 用于滚动升级时检测版本不一致（详见 cluster.md）
+                                         // 单机模式：始终为 None
 }
 ```
 
@@ -464,7 +479,9 @@ pub struct IncomingCommand {
 pub struct ActorHandle {
     tx: mpsc::Sender<ActorMessage>,
     last_active: Arc<AtomicU64>,
+    processing: Arc<AtomicBool>,  // Actor 是否正在处理命令
     generation: u64,  // 唯一标识此 Actor 实例，防止驱逐竞态误删
+    exit_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,  // 通知驱逐方 Actor 已退出
 }
 
 impl ActorHandle {
@@ -475,8 +492,12 @@ impl ActorHandle {
         reply_rx.await.map_err(|_| Error::internal("Actor 无响应"))?
     }
 
-    pub async fn send_deactivate(&self) {
+    /// 发送 Deactivate 并返回等待 Actor 退出的 receiver
+    pub async fn send_deactivate_and_wait(&self) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        *self.exit_tx.lock().await = Some(tx);
         let _ = self.tx.send(ActorMessage::Deactivate).await;
+        rx
     }
 
     pub fn last_active(&self) -> u64 {
@@ -492,10 +513,22 @@ impl ActorHandle {
         self.generation
     }
 
-    /// 检查 mailbox 中是否有待处理消息（用于驱逐保护）
-    pub fn has_pending_messages(&self) -> bool {
-        // capacity - available permits = 当前排队消息数
-        self.tx.max_capacity() - self.tx.capacity() > 0
+    /// 标记 Actor 开始/结束处理命令
+    pub fn set_processing(&self, value: bool) {
+        self.processing.store(value, Ordering::Release);
+    }
+
+    /// 综合判断 Actor 是否繁忙（正在处理 + mailbox 有排队消息）
+    pub fn is_busy(&self) -> bool {
+        self.processing.load(Ordering::Acquire)
+        || self.tx.max_capacity() - self.tx.capacity() > 0
+    }
+
+    /// Actor 退出时调用，通知等待方
+    pub async fn notify_exit(&self) {
+        if let Some(tx) = self.exit_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -724,3 +757,106 @@ spec:
 ```
 
 Host Server 收到 `/admin/shutdown` 后触发 `graceful_shutdown`。
+
+## 背压传播（GraphQL → Gateway → Actor）
+
+### 问题
+
+Actor mailbox 满时返回 503，但如果 GraphQL 层不限制入站请求，高并发下大量请求会堆积在
+Gateway 层等待 Actor mailbox 空间，消耗连接和内存资源。需要端到端的背压传播机制。
+
+### 多层背压设计
+
+```
+客户端 ←── HTTP 503 ←── GraphQL 层 ←── Gateway ←── Actor mailbox
+                         │                │              │
+                    连接数限制        并发请求限制     邮箱有界
+                    请求超时          关闭检查         try_send
+```
+
+### GraphQL / HTTP 层限制
+
+```rust
+pub struct HttpServerConfig {
+    /// 最大并发连接数（超出时拒绝新连接）
+    pub max_connections: usize,          // 默认 10,000
+    /// 单连接最大并发请求数（HTTP/2 multiplexing 场景）
+    pub max_requests_per_connection: usize, // 默认 100
+    /// 请求体大小限制
+    pub max_request_body: usize,         // 默认 1 MB
+    /// 请求处理超时（从接收到响应的总时间）
+    pub request_timeout: Duration,       // 默认 30s
+    /// 慢启动：服务启动后逐步放开连接数，避免冷启动雪崩
+    pub slow_start_duration: Duration,   // 默认 10s
+}
+```
+
+### Gateway 层并发控制
+
+```rust
+use tokio::sync::Semaphore;
+
+pub struct CommandGateway {
+    runtime: Arc<VirtualActorRuntime>,
+    event_store: Arc<dyn EventStore>,
+    idempotency_bloom: RollingBloomFilter,
+    wasm_pool: Arc<WasmPoolManager>,
+    command_registry: CommandRegistry,
+    shutting_down: Arc<AtomicBool>,
+    /// 全局并发命令数限制（防止 Gateway 层请求堆积）
+    concurrency_limiter: Arc<Semaphore>,
+    /// 请求排队超时（等待 semaphore 的最大时间）
+    queue_timeout: Duration,
+}
+
+impl CommandGateway {
+    pub async fn execute(&self, command: IncomingCommand) -> Result<CommandResult> {
+        // 0. 关闭检查
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(Error::service_unavailable("服务正在关闭，请重试"));
+        }
+
+        // 1. 并发控制：超时则返回 503，触发客户端退避重试
+        let _permit = tokio::time::timeout(
+            self.queue_timeout,
+            self.concurrency_limiter.acquire(),
+        ).await
+            .map_err(|_| Error::service_unavailable("请求排队超时，系统繁忙"))?
+            .map_err(|_| Error::internal("信号量已关闭"))?;
+
+        // 后续流程不变：幂等检查 → validate → Actor 路由
+        // ...
+    }
+}
+```
+
+### 配置
+
+```rust
+pub struct BackpressureConfig {
+    /// Gateway 最大并发命令数（建议 = Actor mailbox 总容量 × 2）
+    pub max_concurrent_commands: usize,  // 默认 2048
+    /// 排队超时
+    pub queue_timeout: Duration,         // 默认 5s
+    /// HTTP 层配置
+    pub http: HttpServerConfig,
+}
+```
+
+### 背压信号传播
+
+| 层 | 触发条件 | 响应 | 客户端行为 |
+|----|----------|------|-----------|
+| HTTP | 连接数 > max_connections | 拒绝新连接（TCP RST） | DNS 轮询到其他节点 |
+| GraphQL | 请求超时 > request_timeout | 504 Gateway Timeout | 重试（带退避） |
+| Gateway | semaphore 等待 > queue_timeout | 503 Service Unavailable | 重试（带退避） |
+| Actor | mailbox try_send 失败 | 503 Actor 邮箱已满 | 重试（带退避） |
+
+### 客户端退避建议
+
+```
+重试策略：指数退避 + 抖动
+  base_delay = 100ms
+  max_delay = 5s
+  delay = min(base_delay × 2^attempt + random(0, 100ms), max_delay)
+```
