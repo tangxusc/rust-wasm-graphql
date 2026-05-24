@@ -128,7 +128,9 @@ impl LeaseGuard {
 **解决方案**：Event Store 写入时携带 fencing_token，拒绝过期 token 的写入。
 
 ```rust
-/// Event Store 分片接口增加 fencing_token 参数
+/// Event Store 分片接口（与 event-store.md 统一定义）
+/// fencing_token 为 Option<u64>：集群模式传 Some(token)，单机模式传 None 跳过检查
+/// 集群模式下 token 必须 >= 当前记录的最大 token，否则拒绝写入（防脑裂）
 #[async_trait]
 pub trait EventStoreShard: Send + Sync {
     async fn append_with_idempotency(
@@ -137,7 +139,7 @@ pub trait EventStoreShard: Send + Sync {
         events: &[PendingEvent],
         expected_version: u64,
         command_id: &str,
-        fencing_token: u64,  // 必须 >= 当前记录的最大 token
+        fencing_token: Option<u64>,
     ) -> Result<(), StoreError>;
 }
 ```
@@ -154,14 +156,27 @@ CREATE TABLE aggregate_fencing (
 
 ```sql
 -- 检查并更新 fencing token（原子操作）
+-- 使用严格小于（<）：同一 token 的重复写入也会被拒绝，
+-- 防止网络重传场景下绕过 version conflict 检查
 INSERT INTO aggregate_fencing (aggregate_id, fencing_token)
 VALUES ($1, $2)
 ON CONFLICT (aggregate_id) DO UPDATE
 SET fencing_token = $2
-WHERE aggregate_fencing.fencing_token <= $2;
+WHERE aggregate_fencing.fencing_token < $2;
 
--- 如果 rows_affected = 0，说明 token 过期，拒绝写入
+-- 如果 rows_affected = 0，说明 token 过期或重复，拒绝写入
 ```
+
+**rows_affected 语义说明**（PostgreSQL `ON CONFLICT DO UPDATE ... WHERE` 行为）：
+
+| 场景 | rows_affected | 含义 |
+|------|---------------|------|
+| 新聚合（无冲突，INSERT 成功） | 1 | 首次写入，新行创建 |
+| 已有聚合，新 token 更大（WHERE 满足） | 1 | UPDATE 成功，token 更新 |
+| 已有聚合，token 过期或重复（WHERE 不满足） | 0 | UPDATE 被 WHERE 拒绝，写入被阻止 |
+
+因此 `rows_affected = 0` 精确表示"token 过期或重复"，安全拒绝写入。
+不会与"新聚合首次写入"混淆（首次写入走 INSERT 路径，返回 1）。
 
 Actor 处理命令时的检查：
 
@@ -177,13 +192,13 @@ impl VirtualActor {
 
         // ... validate, handle ...
 
-        // 持久化时携带 fencing_token
+        // 持久化时携带 fencing_token（集群模式 Some，单机模式 None）
         self.event_store.append_with_idempotency(
             &self.aggregate_id,
             &events_to_persist,
             self.version,
             &cmd.command_id,
-            self.lease_guard.fencing_token(),
+            Some(self.lease_guard.fencing_token()),
         ).await?;
 
         // ...
@@ -216,20 +231,50 @@ Lease 过期（节点故障）:
 
 ## 请求路由
 
+### validate 执行位置约定
+
+**validate-X 在接收请求的节点执行一次，转发到 owner 节点时不再重复执行。**
+
+原因：validate 是无状态的纯格式校验（不依赖聚合状态），在任何节点执行结果相同。
+重复执行只会浪费 WASM 实例池资源。
+
+实现：转发请求时携带 `validated: true` 标记，owner 节点收到已验证的请求后跳过 validate：
+
+```rust
+pub struct IncomingCommand {
+    pub command_id: String,
+    pub aggregate_id: String,
+    pub module: String,
+    pub command_type: String,
+    pub data: Vec<u8>,
+    pub validated: bool,  // true = validate 已在源节点执行，owner 节点跳过
+}
+```
+
 ### 方案：客户端侧路由（推荐）
 
 每个节点都持有完整的一致性哈希环，收到请求后判断目标节点：
 
 ```rust
 impl ClusterGateway {
-    pub async fn route_command(&self, command: IncomingCommand) -> Result<CommandResult> {
+    pub async fn route_command(&self, mut command: IncomingCommand) -> Result<CommandResult> {
         let target_node = self.placement.locate(&command.aggregate_id);
 
         if target_node == self.local_node_id {
-            // 本地处理
-            self.local_runtime.send(&command.aggregate_id, command).await
+            // 本地处理（走完整 Gateway 流程）
+            self.local_gateway.execute(command).await
         } else {
-            // 转发到目标节点（gRPC）
+            // 本地先执行 validate（如果有且尚未执行）
+            if !command.validated {
+                let cmd_def = self.command_registry.get(&command.module, &command.command_type);
+                if let Some(validate_fn) = cmd_def.and_then(|c| c.validate_fn.as_ref()) {
+                    let mut instance = self.wasm_pool.acquire(&command.module).await?;
+                    instance.call_validate(validate_fn, &command.data)?;
+                    drop(instance);
+                }
+                command.validated = true;
+            }
+            // 转发到目标节点（gRPC），owner 节点收到后跳过 validate
             self.forward_to(target_node, command).await
         }
     }
@@ -382,3 +427,46 @@ impl ClusterMembership {
 首个节点启动时 `cluster/members/` 为空，哈希环仅包含自身，所有请求本地处理。
 后续节点加入后，哈希环自动更新，新请求根据更新后的哈希环路由。
 已有 Actor 在下次访问时惰性迁移到正确节点。
+
+## 集群限流协调
+
+### 问题
+
+`multi-command-wit.md` 设计了命令级限流，但各节点的 `CommandRateLimiter` 是本地独立的。
+在 N 个节点的集群中，如果每个节点配置 `create-item: 100/s`，实际集群总限流为 `N × 100/s`。
+
+### 方案对比
+
+| 方案 | 精确度 | 延迟开销 | 复杂度 | 适用场景 |
+|------|--------|----------|--------|----------|
+| 本地限流 ÷ 节点数 | 近似（节点数变化时抖动） | 0 | 低 | 大多数场景 |
+| 集中式限流（Redis） | 精确 | +1-2ms | 中 | 严格限流要求 |
+| 令牌桶广播（gossip） | 最终一致 | ~100ms 收敛 | 高 | 大规模集群 |
+
+### 推荐方案：本地限流 ÷ 节点数（默认）
+
+```rust
+impl CommandRateLimiter {
+    /// 根据当前集群节点数动态调整本地限流阈值
+    pub fn adjust_for_cluster(&mut self, node_count: usize) {
+        for limiter in self.limiters.values_mut() {
+            limiter.set_rate(limiter.base_rate() / node_count as f64);
+        }
+    }
+}
+```
+
+节点加入/离开时通过 membership watch 回调触发 `adjust_for_cluster`。
+
+局限性：
+- 负载不均衡时，部分节点可能先达到限流阈值而其他节点仍有余量
+- 节点数变化瞬间存在短暂抖动
+
+对于需要严格精确限流的命令，可按需为特定命令启用 Redis 集中式限流：
+
+```rust
+pub enum RateLimitStrategy {
+    Local,                    // 本地限流 ÷ 节点数（默认，零延迟）
+    Centralized(RedisPool),   // Redis 集中式（精确，+1-2ms）
+}
+```

@@ -159,7 +159,17 @@ impl WasmEngine {
 | 有 `apply-events` | 调用组件实现（行为不变） |
 | 无 `apply-events` | Host 使用内置默认策略：JSON 深度合并 |
 
-**默认策略：JSON Deep Merge + 数组整体替换**
+**默认策略：JSON Deep Merge + 数组整体替换 + null 删除字段**
+
+> **⚠️ 重要约束：使用默认策略时，事件必须携带字段的最终值，而非增量值。**
+>
+> 例如库存调整事件应为 `{"quantity": 95}`（最终值），而非 `{"delta": -5}`（增量值）。
+> 深度合并是"后值覆盖前值"语义，无法执行累加、减法等增量运算。
+>
+> 如果你的事件是增量语义（delta、append、remove 等操作），**必须**自行实现 `apply-events`。
+>
+> **null 语义**：事件中值为 `null` 的字段表示"从状态中删除该字段"。
+> 如果需要表达"字段存在但值为空"，请使用空字符串 `""` 或特殊标记值。
 
 约束：省略 `apply-events` 时，事件数据必须为 JSON 格式。
 
@@ -189,16 +199,25 @@ fn default_apply_events(snapshot: &[u8], events: &[Vec<u8>]) -> Result<Vec<u8>, 
     serde_json::to_vec(&state).map_err(|e| format!("状态序列化失败: {e}"))
 }
 
-/// 深度合并：对象递归合并，数组整体替换，标量覆盖
+/// 深度合并：对象递归合并，null 删除字段，数组整体替换，标量覆盖
 fn deep_merge(base: &mut Value, patch: &Value) {
     match (base, patch) {
         (Value::Object(base_map), Value::Object(patch_map)) => {
             for (k, v) in patch_map {
-                let entry = base_map.entry(k.clone()).or_insert(Value::Null);
-                if v.is_object() && entry.is_object() {
-                    deep_merge(entry, v);
+                if v.is_null() {
+                    // null 语义：删除该字段
+                    base_map.remove(k);
+                } else if v.is_object() {
+                    let entry = base_map
+                        .entry(k.clone())
+                        .or_insert(Value::Object(Default::default()));
+                    if entry.is_object() {
+                        deep_merge(entry, v);
+                    } else {
+                        *entry = v.clone();
+                    }
                 } else {
-                    *entry = v.clone();
+                    base_map.insert(k.clone(), v.clone());
                 }
             }
         }
@@ -222,8 +241,11 @@ fn deep_merge(base: &mut Value, patch: &Value) {
 // event3: TagsUpdated
 {"tags": ["popular", "sale"]}
 
+// event4: ItemDeleted（null 表示删除字段）
+{"created": false, "name": null, "quantity": null, "tags": null}
+
 // 最终状态（深度合并结果）：
-{"name": "Widget", "quantity": 20, "tags": ["popular", "sale"]}
+{"created": false}
 ```
 
 **何时应自行实现 apply-events**：

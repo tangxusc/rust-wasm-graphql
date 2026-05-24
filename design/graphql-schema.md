@@ -106,9 +106,12 @@ pub fn extract_command_meta(
     // 领域参数序列化为 bytes（传递给 WASM）
     let data = serde_json::to_vec(&domain_args)?;
 
-    Ok(IncomingCommand { command_id, aggregate_id, data, module: String::new(), command_type: String::new() })
+    Ok(IncomingCommand { command_id, aggregate_id, data, module: String::new(), command_type: String::new(), validated: false })
 }
 ```
+
+> **注**：`IncomingCommand` 完整定义见 [command-flow.md](./command-flow.md#incomingcommand-结构统一定义)。
+> 此处 `module` 和 `command_type` 由 GraphQL resolver 填充，`validated` 单机模式始终为 false。
 
 ### Schema 构建（适配 Virtual Actor）
 
@@ -181,30 +184,7 @@ Host 通过 WIT 内省判断模块类型：
 
 | 导出接口 | 模块类型 | GraphQL 映射 |
 |----------|----------|-------------|
-| 仅包含普通函数 | 查询模块 | Query 字段 |
-| 包含 `validate-X` + `handle-X` 对 + `apply-events` | 聚合模块 | Mutation 字段 |
-| 两者都有 | 混合模块 | Query + Mutation |
+| 仅包含普通函数（无 `handle-X`） | 查询模块 | Query 字段 |
+| 包含至少一个 `handle-X` 函数（`validate-X` 和 `apply-events` 均可选） | 聚合模块 | Mutation 字段 |
+| 同时包含普通函数和 `handle-X` 函数 | 混合模块 | Query + Mutation |
 
-### GraphQL Subscription（事件推送）
-
-高性能场景下可通过 Subscription 实时推送领域事件：
-
-```graphql
-type Subscription {
-  # 订阅特定聚合的事件流
-  events(aggregateId: String!): DomainEventPayload!
-  
-  # 订阅特定类型的所有事件
-  eventsByType(aggregateType: String!): DomainEventPayload!
-}
-
-type DomainEventPayload {
-  aggregateId: String!
-  eventType: String!
-  version: Int!
-  data: JSON!
-  timestamp: String!
-}
-```
-
-实现基于 Kafka 消费者 → tokio broadcast channel → GraphQL Subscription stream。

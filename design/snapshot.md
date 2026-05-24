@@ -85,7 +85,8 @@ pub struct SnapshotPolicy {
 ```rust
 impl VirtualActor {
     /// 休眠前的清理：保存快照（强一致版无需 flush，事件已同步写入）
-    async fn on_deactivate(&mut self) {
+    /// 使用 &self 因为 Actor 即将销毁，无需更新内部状态
+    async fn on_deactivate(&self) {
         let snapshot = Snapshot {
             aggregate_id: self.aggregate_id.clone(),
             aggregate_type: self.module_name.clone(),
@@ -96,7 +97,6 @@ impl VirtualActor {
         if let Err(e) = self.snapshot_store.save(&snapshot).await {
             tracing::warn!("[{}] 休眠快照保存失败: {e}", self.aggregate_id);
         }
-        self.last_snapshot_version = self.version;
     }
 }
 ```
@@ -125,10 +125,13 @@ pub struct SnapshotScheduler {
 
 ```rust
 impl VirtualActor {
-    fn maybe_snapshot(&mut self) {
-        let events_since = self.version - self.last_snapshot_version;
+    fn maybe_snapshot(&self) {
+        let last = self.last_snapshot_version.load(Ordering::Relaxed);
+        let events_since = self.version - last;
 
         if self.policy.enabled && events_since >= self.policy.threshold {
+            // 乐观更新：先设置为当前版本，防止后续命令重复触发快照
+            self.last_snapshot_version.store(self.version, Ordering::Relaxed);
             let snapshot = Snapshot {
                 aggregate_id: self.aggregate_id.clone(),
                 aggregate_type: self.module_name.clone(),
@@ -137,12 +140,15 @@ impl VirtualActor {
                 created_at: now_millis(),
             };
             let store = self.snapshot_store.clone();
+            let version_before = self.version;
+            let last_snapshot_version = self.last_snapshot_version.clone();
             tokio::spawn(async move {
                 if let Err(e) = store.save(&snapshot).await {
                     tracing::warn!("快照保存失败: {e}");
+                    // 保存失败：回退版本，下次命令会重新尝试快照
+                    last_snapshot_version.store(version_before - 1, Ordering::Relaxed);
                 }
             });
-            self.last_snapshot_version = self.version;
         }
     }
 }

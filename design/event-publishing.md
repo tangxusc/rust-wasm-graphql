@@ -104,7 +104,7 @@ impl KafkaPublisher {
 #[async_trait]
 impl EventPublisher for KafkaPublisher {
     async fn publish(&self, events: &[DomainEvent]) -> Result<()> {
-        let futures: Vec<_> = events.iter().map(|event| {
+        let send_futures: Vec<_> = events.iter().map(|event| {
             let topic = format!("{}.{}", self.topic_prefix, event.aggregate_type);
             let record = FutureRecord::to(&topic)
                 .key(event.aggregate_id.as_bytes())
@@ -117,7 +117,7 @@ impl EventPublisher for KafkaPublisher {
         }).collect();
 
         // 并行等待所有发送完成
-        for result in futures::future::join_all(futures).await {
+        for result in futures::future::join_all(send_futures).await {
             result.map_err(|(e, _)| Error::publish(e))?;
         }
         Ok(())
@@ -127,22 +127,22 @@ impl EventPublisher for KafkaPublisher {
 
 ## 消费者端设计
 
-### Projection 消费者
+### 事件消费者
 
 ```rust
-pub struct ProjectionConsumer {
+pub struct EventConsumer {
     consumer: StreamConsumer,
-    projection: Arc<dyn Projection>,
+    handler: Arc<dyn EventHandler>,
 }
 
-impl ProjectionConsumer {
+impl EventConsumer {
     pub async fn run(&self) -> ! {
         loop {
             match self.consumer.recv().await {
                 Ok(msg) => {
                     let event = self.deserialize_message(&msg);
-                    if let Err(e) = self.projection.apply(&event).await {
-                        tracing::error!("投影应用失败: {e}");
+                    if let Err(e) = self.handler.handle(&event).await {
+                        tracing::error!("事件处理失败: {e}");
                         // 不提交 offset，下次重试
                         continue;
                     }
@@ -155,8 +155,8 @@ impl ProjectionConsumer {
 }
 
 #[async_trait]
-pub trait Projection: Send + Sync {
-    async fn apply(&self, event: &DomainEvent) -> Result<()>;
+pub trait EventHandler: Send + Sync {
+    async fn handle(&self, event: &DomainEvent) -> Result<()>;
 }
 ```
 
@@ -166,8 +166,8 @@ pub trait Projection: Send + Sync {
 |------|----------|
 | 至少一次投递 | 消费者需幂等处理（用 aggregate_id + version 去重） |
 | 顺序保证 | 同 partition（同聚合）内有序 |
-| 消费者组 | 不同投影用不同 consumer group 独立消费 |
-| 重放 | offset reset 从头重放，用于重建投影 |
+| 消费者组 | 不同消费者用不同 consumer group 独立消费 |
+| 重放 | offset reset 从头重放 |
 | 延迟监控 | consumer lag 告警（Kafka 自带指标） |
 
 ## 部署拓扑
@@ -190,7 +190,7 @@ pub trait Projection: Send + Sync {
                  ┌─────────────────────┼───────────────────────┐
                  ▼                     ▼                       ▼
        ┌─────────────────┐  ┌─────────────────┐    ┌──────────────────┐
-       │ Projection:查询  │  │ Projection:报表  │    │ 外部系统通知      │
+       │ 消费者:查询      │  │ 消费者:报表      │    │ 外部系统通知      │
        │ (更新读模型)     │  │ (聚合统计)       │    │ (webhook/邮件)    │
        └─────────────────┘  └─────────────────┘    └──────────────────┘
 ```

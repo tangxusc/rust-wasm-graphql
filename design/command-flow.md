@@ -19,8 +19,8 @@ Client       GraphQL      Gateway        VirtualActorRuntime     Actor(聚合)  
   │              │── cmd ────▶│                  │                   │                 │                │
   │              │ (含 command_type              │                   │                 │                │
   │              │  ="create-item")              │                   │                 │                │
-  │              │            │─ 幂等检查 ──────▶│                   │                 │                │
-  │              │            │  (bloom+KV)      │                   │                 │                │
+  │              │            │─ bloom 快筛 ────▶│                   │                 │                │
+  │              │            │  (命中则查DB)     │                   │                 │                │
   │              │            │                  │                   │                 │                │
   │              │            │─ validate-X() [仅当存在] ───────────────────────────▶│                │
   │              │            │◀─ Ok ───────────────────────────────────────────────│                │
@@ -32,7 +32,7 @@ Client       GraphQL      Gateway        VirtualActorRuntime     Actor(聚合)  
   │              │            │                  │                   │─ handle-X(state) ────────────▶│
   │              │            │                  │                   │◀─ new_events ─────────────────│
   │              │            │                  │                   │                 │                │
-  │              │            │                  │                   │── persist(同步等待) ────────────▶│
+  │              │            │                  │                   │── persist(同步等待，含事务级幂等) ──▶│
   │              │            │                  │                   │◀── ack(已落盘) ─────────────────│
   │              │            │                  │                   │                 │                │
   │              │            │                  │                   │── apply(自定义或默认)─┐          │
@@ -54,28 +54,37 @@ Client       GraphQL      Gateway        VirtualActorRuntime     Actor(聚合)  
 ```rust
 pub struct CommandGateway {
     runtime: Arc<VirtualActorRuntime>,
+    event_store: Arc<dyn EventStore>,
     idempotency_bloom: RollingBloomFilter,
     wasm_pool: Arc<WasmPoolManager>,
     command_registry: CommandRegistry,  // 启动时缓存的命令定义
+    shutting_down: Arc<AtomicBool>,     // 优雅关闭标志
 }
 
 impl CommandGateway {
     pub async fn execute(&self, command: IncomingCommand) -> Result<CommandResult> {
+        // 0. 关闭检查：防止 HTTP listener 关闭前已进入 Gateway 的请求继续进入 Actor mailbox
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(Error::service_unavailable("服务正在关闭，请重试"));
+        }
+
         // 1. 双层幂等检查（布隆过滤器 + Event Store 内事务级幂等）
         if self.idempotency_bloom.might_contain(&command.command_id) {
-            if self.runtime.idempotency_exists(&command.aggregate_id, &command.command_id).await? {
+            if self.event_store.idempotency_exists(&command.command_id).await? {
                 return Ok(CommandResult::duplicate());
             }
         }
 
-        // 2. 前置 validate-X（仅当该命令有 validate 函数时执行）
+        // 2. 前置 validate-X（仅当该命令有 validate 函数且尚未执行时）
         let cmd_def = self.command_registry.get(&command.module, &command.command_type);
-        if let Some(validate_fn) = cmd_def.and_then(|c| c.validate_fn.as_ref()) {
-            let mut instance = self.wasm_pool.acquire(&command.module).await?;
-            instance.call_function(validate_fn, &[command.data.clone()])?;
-            drop(instance);
+        if !command.validated {
+            if let Some(validate_fn) = cmd_def.and_then(|c| c.validate_fn.as_ref()) {
+                let mut instance = self.wasm_pool.acquire(&command.module).await?;
+                instance.call_validate(validate_fn, &command.data)?;
+                drop(instance);
+            }
         }
-        // 无 validate 函数时：直接跳过，进入 Actor 处理
+        // 无 validate 函数或已在源节点执行时：直接跳过，进入 Actor 处理
 
         // 3. 透明寻址：运行时自动激活/路由
         //    幂等键在 Event Store 同一事务中写入，无窗口丢失风险
@@ -99,6 +108,8 @@ pub struct VirtualActorRuntime {
     active: DashMap<String, ActorHandle>,
     /// 激活锁：防止同一聚合并发激活（per-key 粒度）
     activation_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// 全局递增的 Actor generation（用于防止驱逐竞态下误删新 Actor）
+    next_generation: AtomicU64,
     /// 内存预算
     max_active: usize,
     /// 空闲超时
@@ -142,8 +153,11 @@ impl VirtualActorRuntime {
         }
 
         let handle = self.activate(aggregate_id, module).await?;
-        // 激活完成后清理锁（可选，防止锁表无限增长）
-        self.activation_locks.remove(aggregate_id);
+        // 注意：不在此处清理 activation_locks，防止竞态。
+        // 场景：线程 A 完成激活并 remove 锁 → 线程 B 同时 entry().or_insert_with() 获取新锁
+        // → 线程 C 也获取到不同的锁实例 → A、C 同时激活同一聚合，破坏互斥。
+        // 锁条目的内存开销极小（每个 aggregate_id 仅一个 Arc<Mutex<()>>），
+        // 由后台定时任务清理长期未使用的条目即可（见 run_lock_cleaner）。
         Ok(handle)
     }
 
@@ -185,9 +199,11 @@ impl VirtualActorRuntime {
 
         let active_ref = self.active.clone();
         let agg_id = aggregate_id.to_string();
+        let generation = handle.generation();
         tokio::spawn(async move {
             actor.run().await;
-            active_ref.remove(&agg_id);
+            // 仅移除自身 generation 的条目，防止驱逐竞态下误删新激活的 Actor
+            active_ref.remove_if(&agg_id, |_, h| h.generation() == generation);
         });
 
         Ok(handle)
@@ -222,7 +238,15 @@ impl VirtualActorRuntime {
     }
 
     /// LRU 驱逐（带保护：不驱逐有待处理消息或刚活跃的 Actor）
-    /// 返回 true 表示成功驱逐了一个 Actor，false 表示无可驱逐候选者
+    /// 返回 true 表示成功发起了一个 Actor 的驱逐，false 表示无可驱逐候选者
+    ///
+    /// 安全性说明：evict_one 仅发送 Deactivate 消息，不从 active 中移除。
+    /// Actor 处理完 mailbox 中所有待处理命令后收到 Deactivate，保存快照并退出，
+    /// 退出时通过 tokio::spawn 中的 remove_if 自动从 active 中清理。
+    /// 这消除了"先 remove 后 Deactivate"的竞态窗口，确保排队消息不会丢失。
+    ///
+    /// 注意：已发送 Deactivate 但尚未退出的 Actor 仍占用 active 槽位。
+    /// activate() 中的内存压力检查需要考虑这一点（短暂等待或增加少量余量）。
     async fn evict_one(&self) -> bool {
         let now = now_millis();
         let min_idle_ms = self.min_evict_idle.as_millis() as u64;
@@ -239,7 +263,10 @@ impl VirtualActorRuntime {
             .map(|entry| entry.key().clone());
 
         if let Some(id) = candidate {
-            if let Some((_, handle)) = self.active.remove(&id) {
+            // 仅发送 Deactivate，不从 active 中移除
+            // Actor 处理完 mailbox 后收到 Deactivate，自行保存快照并退出
+            // 退出时 tokio::spawn 中的 remove_if 自动清理 active 条目
+            if let Some(handle) = self.active.get(&id) {
                 handle.send_deactivate().await;
             }
             true
@@ -259,13 +286,14 @@ pub struct VirtualActor {
     state: Vec<u8>,             // 内存中的当前状态（始终与 DB 一致）
     version: u64,               // 已持久化的版本号
     has_custom_apply: bool,     // 是否有自定义 apply-events 实现
+    fencing_token: Option<u64>, // 集群模式 Some(token)，单机模式 None（见 cluster.md）
     wasm_pool: Arc<WasmPoolManager>,
     event_store: Arc<dyn EventStore>,
     snapshot_store: Arc<dyn SnapshotStore>,
     mailbox: mpsc::Receiver<ActorMessage>,
     handle: ActorHandle,        // 持有自身 handle 引用，用于统一更新 last_active
     idle_timeout: Duration,
-    last_snapshot_version: u64,
+    last_snapshot_version: Arc<AtomicU64>,  // 与 spawn 任务共享，失败时可回退
     snapshot_threshold: u64,
 }
 
@@ -311,6 +339,19 @@ impl VirtualActor {
         let new_events = instance.call_function(&handle_fn, &[self.state.clone(), cmd.data.clone()])?;
         drop(instance);
 
+        // 1.5 No-op 处理：handle 返回空事件列表表示命令合法但无副作用
+        //     不写幂等键、不写事件，直接返回成功。
+        //     重试安全：状态不变 → handle 再次返回空事件 → 再次 no-op。
+        //     前提：handle 必须是确定性的。
+        if new_events.is_empty() {
+            return Ok(CommandResult {
+                success: true,
+                version: self.version,
+                event_count: 0,
+                error: None,
+            });
+        }
+
         // 2. 同步持久化到 Event Store（事件 + 幂等键在同一事务中写入）
         let events_to_persist: Vec<PendingEvent> = new_events.iter().enumerate()
             .map(|(i, data)| PendingEvent {
@@ -326,6 +367,7 @@ impl VirtualActor {
             &events_to_persist,
             self.version,
             &cmd.command_id,
+            self.fencing_token,  // 单机模式 None，集群模式 Some(token)（见 cluster.md）
         ).await?;
 
         // 3. DB 已确认 → 安全更新内存状态
@@ -352,9 +394,13 @@ impl VirtualActor {
     }
 
     /// 快照判断（异步，不阻塞响应）
-    fn maybe_snapshot(&mut self) {
-        let events_since = self.version - self.last_snapshot_version;
+    /// 使用 Arc<AtomicU64> 统一管理快照版本，spawn 任务失败时可安全回退
+    fn maybe_snapshot(&self) {
+        let last = self.last_snapshot_version.load(Ordering::Relaxed);
+        let events_since = self.version - last;
         if events_since >= self.snapshot_threshold {
+            // 乐观更新：先设置为当前版本，防止后续命令重复触发快照
+            self.last_snapshot_version.store(self.version, Ordering::Relaxed);
             let snapshot = Snapshot {
                 aggregate_id: self.aggregate_id.clone(),
                 aggregate_type: self.module_name.clone(),
@@ -363,8 +409,14 @@ impl VirtualActor {
                 created_at: now_millis(),
             };
             let store = self.snapshot_store.clone();
-            tokio::spawn(async move { let _ = store.save(&snapshot).await; });
-            self.last_snapshot_version = self.version;
+            let version_before = self.version;
+            let last_snapshot_version = self.last_snapshot_version.clone();
+            tokio::spawn(async move {
+                if store.save(&snapshot).await.is_err() {
+                    // 保存失败：回退版本，下次命令会重新尝试快照
+                    last_snapshot_version.store(version_before - 1, Ordering::Relaxed);
+                }
+            });
         }
     }
 
@@ -385,13 +437,25 @@ impl VirtualActor {
 ## 关键设计：持久化在响应之前
 
 ```
-异步刷盘（已废弃）：
-  handle → 更新内存 → 响应客户端 → ... → 异步刷盘
-  问题：崩溃时丢失未刷盘事件
-
 强一致（当前方案）：
   handle → persist(等待DB确认) → 更新内存 → 响应客户端
   保证：客户端收到成功 = 事件已落盘 = 零数据丢失
+```
+
+## IncomingCommand 结构（统一定义）
+
+```rust
+/// 入站命令（所有文档中 IncomingCommand 的权威定义）
+pub struct IncomingCommand {
+    pub command_id: String,      // 幂等键（全局唯一）
+    pub aggregate_id: String,    // 聚合根 ID
+    pub module: String,          // 模块名（如 "inventory"），由 GraphQL resolver 填充
+    pub command_type: String,    // 命令类型 kebab-case（如 "create-item"）
+    pub data: Vec<u8>,           // 序列化的命令参数
+    pub validated: bool,         // 集群模式：true 表示 validate 已在源节点执行，
+                                 // owner 节点跳过（详见 cluster.md）
+                                 // 单机模式：始终为 false
+}
 ```
 
 ## Actor 句柄与消息
@@ -400,16 +464,14 @@ impl VirtualActor {
 pub struct ActorHandle {
     tx: mpsc::Sender<ActorMessage>,
     last_active: Arc<AtomicU64>,
+    generation: u64,  // 唯一标识此 Actor 实例，防止驱逐竞态误删
 }
 
 impl ActorHandle {
     pub async fn send(&self, command: IncomingCommand) -> Result<CommandResult> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx.send(ActorMessage::Command { command, reply_tx })
-            .await
+        self.tx.try_send(ActorMessage::Command { command, reply_tx })
             .map_err(|_| Error::overloaded("Actor 邮箱已满"))?;
-        // 注意：此处不更新 last_active，由 Actor 处理消息时统一更新
-        // 确保驱逐器和 Actor 自身空闲检测使用同一时钟源
         reply_rx.await.map_err(|_| Error::internal("Actor 无响应"))?
     }
 
@@ -424,6 +486,10 @@ impl ActorHandle {
     /// 由 Actor 在处理消息时调用，统一时钟源
     pub fn touch(&self) {
         self.last_active.store(now_millis(), Ordering::Relaxed);
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// 检查 mailbox 中是否有待处理消息（用于驱逐保护）
@@ -478,6 +544,37 @@ enum ActorMessage {
 
 ## 内存管理
 
+### 激活锁清理（防止锁表无限增长）
+
+```rust
+impl VirtualActorRuntime {
+    /// 定期清理不再需要的激活锁条目
+    /// 清理条件：锁当前未被持有（try_lock 成功说明无人等待激活）
+    /// 无论 Actor 是否在 active 中，只要锁空闲即可安全清理：
+    /// - Actor 在 active 中：激活已完成，锁使命结束
+    /// - Actor 不在 active 中（已休眠）：锁同样无用，下次激活会重新创建
+    async fn run_lock_cleaner(&self) {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            let stale_keys: Vec<String> = self.activation_locks.iter()
+                .filter(|entry| {
+                    // 锁当前未被持有（无线程正在等待激活）
+                    entry.value().try_lock().is_ok()
+                })
+                .map(|entry| entry.key().clone())
+                .collect();
+
+            for key in stale_keys {
+                self.activation_locks.remove(&key);
+            }
+        }
+    }
+}
+```
+
+### LRU 驱逐
+
 ```rust
 impl VirtualActorRuntime {
     async fn run_evictor(&self) {
@@ -498,7 +595,8 @@ impl VirtualActorRuntime {
                 .collect();
 
             for id in to_evict {
-                if let Some((_, handle)) = self.active.remove(&id) {
+                // 仅发送 Deactivate，Actor 自行退出后从 active 移除
+                if let Some(handle) = self.active.get(&id) {
                     handle.send_deactivate().await;
                 }
             }
@@ -550,24 +648,31 @@ pub struct VirtualActorConfig {
 ```
 SIGTERM / Kubernetes preStop
     │
-    ├── 1. 停止接收新请求（HTTP listener 关闭）
+    ├── 1. Gateway 设置 shutdown flag（拒绝新请求，返回 503）
+    │      注意：HTTP listener 关闭前，已进入 Gateway 但尚未 send 到 Actor 的请求
+    │      会被 shutdown flag 拦截，避免关闭过程中仍有新命令进入 mailbox
     │
-    ├── 2. 等待所有 Actor mailbox 排空（已接收的命令处理完毕）
+    ├── 2. 停止接收新连接（HTTP listener 关闭）
+    │
+    ├── 3. 等待所有 Actor mailbox 排空（已接收的命令处理完毕）
     │      超时：shutdown_timeout（默认 30s）
     │
-    ├── 3. 向所有活跃 Actor 发送 Deactivate（保存快照）
+    ├── 4. 向所有活跃 Actor 发送 Deactivate（保存快照）
     │
-    ├── 4. 等待所有 Actor 退出
+    ├── 5. 等待所有 Actor 退出
     │      超时：额外 10s
     │
-    └── 5. 关闭连接池、释放资源
+    └── 6. 关闭连接池、释放资源
 ```
 
 ### 实现
 
 ```rust
 impl VirtualActorRuntime {
-    pub async fn graceful_shutdown(&self, timeout: Duration) {
+    pub async fn graceful_shutdown(&self, gateway_shutdown: &AtomicBool, timeout: Duration) {
+        // 阶段 0：设置 Gateway shutdown 标志，拒绝新请求
+        gateway_shutdown.store(true, Ordering::Release);
+
         // 阶段 1：等待所有 Actor 处理完当前命令
         let deadline = Instant::now() + timeout;
         loop {

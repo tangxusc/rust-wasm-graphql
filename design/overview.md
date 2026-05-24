@@ -28,13 +28,13 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          GraphQL API (axum)                               │
-│              Query (读模型/投影)    │    Mutation (命令入口)               │
+│              Query (查询)           │    Mutation (命令入口)               │
 └──────────────────┬─────────────────┴──────────────────┬─────────────────┘
                    │                                     │
-          ┌────────▼────────┐               ┌───────────▼──────────────┐
-          │  Projection     │               │  Command Gateway         │
-          │  (读取投影视图)  │               │  幂等检查(布隆+KV)       │
-          └────────┬────────┘               └───────────┬──────────────┘
+                   │                        ┌───────────▼──────────────┐
+                   │                        │  Command Gateway         │
+                   │                        │  幂等检查(布隆+KV)       │
+                   │                        └───────────┬──────────────┘
                    │                                     │
                    │                        ┌────────────▼─────────────────┐
                    │                        │  Virtual Actor Runtime        │
@@ -57,7 +57,7 @@
                    │                        └────────────┬─────────────────┘
                    │                                     │ 同步写入（等待确认）
           ┌────────┴─────────────────────────────────────▼─────────────────┐
-          │                    Event Store (分片)                            │
+          │           Event Store (当前：单实例 PG，未来：分片集群)            │
           └────────────────────────────────────┬───────────────────────────┘
                                                │ CDC (WAL 监听)
                                       ┌────────▼────────┐
@@ -98,25 +98,31 @@
 | Virtual Actor Runtime | 聚合激活/休眠/寻址/内存管理 | Rust (DashMap + tokio spawn) |
 | Virtual Actor | 单聚合状态管理、同步持久化 | tokio mpsc channel |
 | WASM Instance Pool | 参数校验、命令决策、事件应用 | Wasmtime 预热实例池 |
-| Event Store | 分片事件追加、同步写入 | PostgreSQL 分片集群 |
+| Event Store | 事件追加、同步写入 | PostgreSQL（当前单实例，未来可分片） |
 | Snapshot Store | 快照点查点写、Actor 恢复/休眠 | KV 存储 (Redis / sled) |
 | Event Publisher | CDC 捕获 + Kafka 发布 | Debezium / WAL 监听 |
-| Projection | 消费事件构建读模型 | 独立消费者进程 |
 
 ## 性能目标
 
+### 当前阶段（单实例 PostgreSQL）
+
 | 指标 | 目标值 | 前提条件 |
 |------|--------|----------|
-| 单机吞吐（单分片） | ~30,000 TPS | 1 PG 实例 |
-| 单机吞吐（多分片） | 60,000 - 120,000 TPS | 2-4 本地 PG 实例 |
-| 集群吞吐 | 500,000+ TPS | 16+ 分片，多节点 |
+| 单机吞吐 | ~30,000 TPS | 1 PG 实例 |
 | 热聚合命令延迟 P99 | < 15ms（内存命中 + 同步写 DB） | 本地 PG，SSD |
 | 冷聚合激活延迟 P99 | < 50ms（快照恢复） | 快照存在 |
 | Actor 激活时间 | < 10ms（有快照）/ < 500ms（无快照） | — |
 
+### 未来演进（分片 + 集群）
+
+| 指标 | 目标值 | 前提条件 |
+|------|--------|----------|
+| 单机吞吐（多分片） | 60,000 - 120,000 TPS | 2-4 本地 PG 实例 |
+| 集群吞吐 | 500,000+ TPS | 16+ 分片，多节点 |
+
 注：
 - 同步写入延迟（PG commit + fsync）通常 1-5ms，加上 WASM 调用和 Actor 调度，P99 < 15ms 是务实目标
-- 通过 Event Store 分片 + Virtual Actor 并行弥补同步写入的吞吐开销
+- 未来通过 Event Store 分片 + Virtual Actor 并行弥补同步写入的吞吐开销
 - 集群方案详见 [cluster.md](./cluster.md)
 
 ## 内存预算模型
@@ -137,3 +143,54 @@ max_active = Actor 可用内存 / (平均聚合状态大小 + Actor 开销 ~1KB)
 
 注：WASM 实例的线性内存大小取决于组件复杂度，简单组件可能仅 64KB-256KB，
 复杂组件（含大量静态数据）可达 4MB+。部署前应实测单实例内存占用。
+
+## 查询侧设计（CQRS 读模型）
+
+本系统采用 CQRS 模式，命令侧（Mutation）和查询侧（Query）分离：
+
+### 查询模块（WASM 直接查询）
+
+非聚合的 WASM 组件可导出普通函数，Host 自动映射为 GraphQL Query 字段。
+这类查询适用于无状态计算或简单数据转换，不涉及事件溯源。
+
+```wit
+package example:utils;
+
+interface queries {
+    calculate-tax: func(amount: u64, rate: f32) -> u64;
+    format-address: func(parts: list<string>) -> string;
+}
+
+world utils-queries {
+    export queries;
+}
+```
+
+### 读模型投影（事件驱动）
+
+聚合的查询通过事件消费者构建读模型，与命令侧完全解耦：
+
+```
+命令侧：GraphQL Mutation → Actor → Event Store
+                                        │ CDC
+                                        ▼
+查询侧：Kafka → 投影消费者 → 读模型 DB → GraphQL Query
+```
+
+读模型的构建和查询不在本系统核心范围内，由下游消费者自行实现。
+Host Server 仅负责：
+1. 命令处理（Mutation）— 通过 Virtual Actor + Event Store
+2. 无状态查询（Query）— 通过普通 WASM 组件直接调用
+3. 事件发布（CDC → Kafka）— 供下游消费者构建读模型
+
+### 为什么不在 Host 内建读模型
+
+| 考量 | 说明 |
+|------|------|
+| 职责单一 | Host 专注命令处理和事件持久化，读模型由专用服务承担 |
+| 独立扩缩 | 读写负载特征不同，分离后可独立扩缩容 |
+| 技术选型自由 | 读模型可用 Elasticsearch、ClickHouse 等最适合查询模式的存储 |
+| 最终一致性 | 读模型天然接受最终一致，无需与命令侧共享强一致保证 |
+
+> 注：查询侧投影（Projection）不在本系统核心范围内，相关设计说明已合并至本节。
+> 下游消费者可参考 [event-publishing.md](./event-publishing.md) 中的消费者端设计获取事件流接入方式。

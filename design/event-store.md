@@ -1,45 +1,13 @@
-# 事件存储设计（强一致版）
+# 事件存储设计（单实例 PostgreSQL）
 
-## 核心变化
+## 设计目标
 
-- **分片架构**：按 aggregate_id hash 分布到多个 PostgreSQL 实例
+- **单一 PostgreSQL 实例**：当前阶段不考虑分片，后续可迁移至分布式数据库
 - **同步写入**：每次命令的事件同步写入 DB，等待确认后才响应客户端
-- **CDC 替代 Outbox 轮询**：通过 WAL 监听实现零延迟事件发布
-- **版本号校验**：Virtual Actor 串行处理保证无并发，版本号用于恢复校验和防御性检查
-
-## 分片策略
-
-```
-aggregate_id → xxh3_64 hash → shard_id = hash % shard_count
-```
-
-```rust
-pub struct ShardedEventStore {
-    shards: Vec<Arc<dyn EventStoreShard>>,
-    shard_count: usize,
-}
-
-impl ShardedEventStore {
-    pub fn shard_for(&self, aggregate_id: &str) -> &Arc<dyn EventStoreShard> {
-        let hash = xxhash_rust::xxh3::xxh3_64(aggregate_id.as_bytes());
-        let idx = (hash as usize) % self.shard_count;
-        &self.shards[idx]
-    }
-}
-```
-
-### 分片数量建议
-
-| 集群规模 | 分片数 | 单分片 TPS | 总 TPS |
-|----------|--------|-----------|--------|
-| 开发 | 1 | 30,000 | 30,000 |
-| 小型生产 | 4 | 30,000 | 120,000 |
-| 中型生产 | 16 | 30,000 | 480,000 |
-| 大型生产 | 64 | 30,000 | 1,920,000 |
+- **事务级幂等**：幂等键与事件在同一事务中写入，原子保证
+- **CDC 事件发布**：通过 WAL 监听实现零延迟事件发布
 
 ## 数据模型
-
-### events 表（每个分片独立）
 
 ```sql
 CREATE TABLE events (
@@ -55,6 +23,8 @@ CREATE TABLE events (
     UNIQUE (aggregate_id, version)
 );
 
+CREATE INDEX idx_events_aggregate ON events (aggregate_id, version);
+
 -- 幂等键表（与 events 同库，支持同事务写入）
 CREATE TABLE idempotency_keys (
     command_id      VARCHAR(128) PRIMARY KEY,
@@ -65,54 +35,9 @@ CREATE TABLE idempotency_keys (
 CREATE INDEX idx_idempotency_created ON idempotency_keys (created_at);
 ```
 
-### 写入优化配置（PostgreSQL）
-
-```sql
--- 针对同步写入场景的调优
-ALTER TABLE events SET (autovacuum_vacuum_scale_factor = 0.01);
-ALTER TABLE events SET (fillfactor = 90);
-
--- 连接池预热，减少首次连接延迟
--- 推荐使用 PgBouncer 或 sqlx 内置连接池
-
--- 分区表（按时间，便于归档）
-CREATE TABLE events (
-    -- ... 同上
-) PARTITION BY RANGE (created_at);
-
--- 分区自动管理（推荐使用 pg_partman 或自定义定时任务）
--- 自动创建未来分区 + 归档过期分区
--- 示例：按季度分区，提前创建下一季度分区
-```
-
-### 分区自动管理
-
-生产环境必须自动管理分区，避免手动创建导致遗漏：
-
-```sql
--- 方案 A：使用 pg_partman（推荐）
-SELECT partman.create_parent(
-    p_parent_table := 'public.events',
-    p_control := 'created_at',
-    p_type := 'native',
-    p_interval := '3 months',
-    p_premake := 2  -- 提前创建 2 个未来分区
-);
-
--- 方案 B：自定义定时任务（pg_cron）
--- 每月 1 日检查并创建下季度分区
-SELECT cron.schedule('create-event-partitions', '0 0 1 * *', $$
-    SELECT partman.run_maintenance('public.events');
-$$);
-```
-
-归档策略：超过保留期（如 1 年）的分区可 detach 后归档到冷存储（S3）。
-
 ## Trait 定义
 
 ```rust
-use async_trait::async_trait;
-
 #[derive(Debug, Clone)]
 pub struct DomainEvent {
     pub aggregate_id: String,
@@ -151,21 +76,22 @@ pub enum StoreError {
     SerializationError(String),
 }
 
-/// 单分片事件存储接口
+/// 事件存储接口
 #[async_trait]
-pub trait EventStoreShard: Send + Sync {
+pub trait EventStore: Send + Sync {
     /// 同步追加事件 + 幂等键（同一事务，原子保证）
     /// 调用方等待此方法返回后才响应客户端，保证零数据丢失
+    ///
+    /// fencing_token：集群模式下传 Some(token)，用于防止脑裂双写（详见 cluster.md）；
+    /// 单机模式传 None，跳过 fencing 检查。
     async fn append_with_idempotency(
         &self,
         aggregate_id: &str,
         events: &[PendingEvent],
         expected_version: u64,
         command_id: &str,
+        fencing_token: Option<u64>,
     ) -> Result<(), StoreError>;
-
-    /// 批量追加（无幂等键，用于数据迁移等场景）
-    async fn batch_append(&self, events: &[PendingEvent]) -> Result<(), StoreError>;
 
     /// 加载聚合的全部事件（Virtual Actor 激活时使用）
     async fn load_events(&self, aggregate_id: &str) -> Result<Vec<DomainEvent>, StoreError>;
@@ -185,90 +111,96 @@ pub trait EventStoreShard: Send + Sync {
 }
 ```
 
-## 同步写入实现（含事务级幂等）
+## 同步写入实现
 
 ```rust
-/// 同步写入 — 事件 + 幂等键在同一事务中写入，原子保证
-/// 此方法返回 Ok 意味着：事件已落盘 + 幂等键已记录，无窗口丢失
-async fn append_with_idempotency(
-    &self,
-    aggregate_id: &str,
-    events: &[PendingEvent],
-    expected_version: u64,
-    command_id: &str,
-) -> Result<(), StoreError> {
-    if events.is_empty() { return Ok(()); }
-
-    let mut tx = self.pool.begin().await
-        .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
-
-    // 写入幂等键（ON CONFLICT 检测重复命令）
-    let inserted = sqlx::query(
-        "INSERT INTO idempotency_keys (command_id) VALUES ($1) ON CONFLICT DO NOTHING"
-    )
-    .bind(command_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
-
-    if inserted.rows_affected() == 0 {
-        return Err(StoreError::DuplicateCommand(command_id.to_string()));
-    }
-
-    // 写入事件
-    for (i, event) in events.iter().enumerate() {
-        let version = expected_version + 1 + i as u64;
-        sqlx::query(
-            "INSERT INTO events (aggregate_id, aggregate_type, event_type, version, data) \
-             VALUES ($1, $2, $3, $4, $5)"
-        )
-        .bind(aggregate_id)
-        .bind(&event.aggregate_type)
-        .bind(&event.event_type)
-        .bind(version as i64)
-        .bind(&event.data)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| match e {
-            sqlx::Error::Database(ref db_err) if db_err.code() == Some("23505".into()) => {
-                StoreError::VersionConflict {
-                    aggregate_id: aggregate_id.to_string(),
-                    expected_version,
-                    attempted_version: version,
-                }
-            }
-            _ => StoreError::ConnectionError(e.to_string()),
-        })?;
-    }
-
-    tx.commit().await
-        .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
-
-    Ok(())
+pub struct PgEventStore {
+    pool: PgPool,
 }
-```
 
-### 写入性能优化（在保证同步确认的前提下）
+impl PgEventStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
 
-| 优化手段 | 说明 | 影响 |
-|----------|------|------|
-| 连接池预热 | 避免首次连接延迟 | 减少 P99 |
-| 多行 INSERT | 单条 SQL 写入多个事件 | 减少网络往返 |
-| 预编译语句 | prepared statement 复用 | 减少解析开销 |
-| synchronous_commit=on | PostgreSQL 默认，保证 WAL 落盘 | 零丢失 |
-| 分片并行 | 不同聚合写入不同分片，互不阻塞 | 线性扩展 |
+#[async_trait]
+impl EventStore for PgEventStore {
+    async fn append_with_idempotency(
+        &self,
+        aggregate_id: &str,
+        events: &[PendingEvent],
+        expected_version: u64,
+        command_id: &str,
+        _fencing_token: Option<u64>,
+    ) -> Result<(), StoreError> {
+        if events.is_empty() { return Ok(()); }
+
+        let mut tx = self.pool.begin().await
+            .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+
+        // 写入幂等键（ON CONFLICT 检测重复命令）
+        let inserted = sqlx::query(
+            "INSERT INTO idempotency_keys (command_id) VALUES ($1) \
+             ON CONFLICT DO NOTHING"
+        )
+        .bind(command_id)
+        .execute(&mut *tx).await
+        .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+
+        if inserted.rows_affected() == 0 {
+            return Err(StoreError::DuplicateCommand(command_id.to_string()));
+        }
+
+        // 写入事件
+        for (i, event) in events.iter().enumerate() {
+            let version = expected_version + 1 + i as u64;
+            sqlx::query(
+                "INSERT INTO events \
+                 (aggregate_id, aggregate_type, event_type, version, data) \
+                 VALUES ($1, $2, $3, $4, $5)"
+            )
+            .bind(aggregate_id)
+            .bind(&event.aggregate_type)
+            .bind(&event.event_type)
+            .bind(version as i64)
+            .bind(&event.data)
+            .execute(&mut *tx).await
+            .map_err(|e| match e {
+                sqlx::Error::Database(ref db_err)
+                    if db_err.code() == Some("23505".into()) =>
+                {
+                    StoreError::VersionConflict {
+                        aggregate_id: aggregate_id.to_string(),
+                        expected_version,
+                        attempted_version: version,
+                    }
+                }
+                _ => StoreError::ConnectionError(e.to_string()),
+            })?;
+        }
+
+        tx.commit().await
+            .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+
+        Ok(())
+    }
+}
 ```
 
 ## 幂等存储（双层设计）
 
-### 第一层：滚动布隆过滤器（零 IO，防无限增长）
+### command_id 约定
+
+**command_id 必须全局唯一。** 推荐格式：`{aggregate_id}:{uuid}` 或纯 UUID。
+
+### 第一层：滚动布隆过滤器（内存，零 IO）
 
 ```rust
 use probabilistic_collections::bloom::BloomFilter;
 use parking_lot::RwLock;
 
-/// 滚动布隆过滤器：两代交替，防止无限增长导致误判率飙升
-/// 轮换操作使用单一写锁保护，确保原子性
+/// 滚动布隆过滤器：两代交替，防止无限增长
 pub struct RollingBloomFilter {
     inner: RwLock<BloomFilterInner>,
     capacity: usize,
@@ -307,8 +239,9 @@ impl RollingBloomFilter {
         inner.current.insert(command_id);
         inner.inserted += 1;
         if inner.inserted >= inner.rotate_threshold {
-            // 轮换在同一写锁内完成，保证原子性
-            let new_filter = BloomFilter::with_rate(self.false_positive_rate, self.capacity);
+            let new_filter = BloomFilter::with_rate(
+                self.false_positive_rate, self.capacity
+            );
             let old_current = std::mem::replace(&mut inner.current, new_filter);
             inner.previous = old_current;
             inner.inserted = 0;
@@ -317,41 +250,188 @@ impl RollingBloomFilter {
 }
 ```
 
-**容量规划**：
+### 第二层：DB 精确检查（事务内）
 
-| 日命令量 | 单代容量 | 内存占用 | 轮换频率 |
-|----------|---------|---------|---------|
-| 100万/天 | 200万 | ~2.4 MB | ~1次/天 |
-| 1000万/天 | 2000万 | ~24 MB | ~1次/天 |
-| 1亿/天 | 2亿 | ~240 MB | ~1次/天 |
+幂等键存储在 `idempotency_keys` 表中，通过 `append_with_idempotency` 在同一事务中原子写入。
 
-注：进程重启后布隆过滤器为空，所有请求穿透到 DB 层的 `idempotency_keys` 表。
-由于幂等键已在 Event Store 同事务中写入，DB 层查询是正确性兜底，布隆过滤器仅为性能优化。
-
-### 第二层：DB 精确检查（事务内，仅布隆过滤器命中时触发）
-
-幂等键存储在 Event Store 同库的 `idempotency_keys` 表中（见上方 DDL），
-通过 `append_with_idempotency` 在同一事务中原子写入。
-
-**重要**：幂等键与事件在同一事务中写入，因此幂等键存储在 aggregate_id 所在的分片。
-Gateway 层的幂等检查必须按 aggregate_id 路由到正确分片：
-
-```rust
-impl ShardedEventStore {
-    pub async fn idempotency_exists(&self, aggregate_id: &str, command_id: &str) -> Result<bool> {
-        // 幂等键随事件写入 aggregate_id 所在分片，查询时必须路由到同一分片
-        let shard = self.shard_for(aggregate_id);
-        shard.idempotency_exists(command_id).await
-    }
-}
-```
-
-### 性能对比
+双层设计下，99% 的请求无需网络 IO 即可完成幂等判断：
 
 | 方案 | 延迟 | 适用场景 |
 |------|------|----------|
 | 仅布隆过滤器 | ~10ns | 99% 的非重复请求直接放行 |
-| 布隆 + KV | ~200μs | 1% 误判时精确检查 |
-| 仅 KV | ~200μs | 每次都有网络 IO |
+| 布隆命中 → DB 精确检查 | ~200μs | 1% 误判时精确检查 |
 
-双层设计下，99% 的请求无需任何网络 IO 即可完成幂等判断。
+注：进程重启后布隆过滤器为空，需要启动预热避免穿透到 DB 层。
+
+### 启动预热
+
+服务启动时从 `idempotency_keys` 表加载最近 72 小时的 key 填充布隆过滤器，
+避免重启后短时间内大量重复请求穿透到 DB：
+
+```rust
+impl RollingBloomFilter {
+    /// 启动时从 DB 预热布隆过滤器
+    pub async fn warm_up(
+        &self,
+        pool: &PgPool,
+        retention: Duration,
+    ) -> Result<usize> {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(retention).unwrap();
+
+        // 分批加载，避免一次性加载百万级 key
+        let mut cursor = String::new();
+        let batch_size = 10_000;
+        let mut total = 0;
+
+        loop {
+            let keys: Vec<String> = sqlx::query_scalar(
+                "SELECT command_id FROM idempotency_keys \
+                 WHERE created_at > $1 AND command_id > $2 \
+                 ORDER BY command_id LIMIT $3"
+            )
+            .bind(&cutoff)
+            .bind(&cursor)
+            .bind(batch_size as i64)
+            .fetch_all(pool).await?;
+
+            if keys.is_empty() { break; }
+
+            for key in &keys {
+                self.insert(key);
+            }
+            cursor = keys.last().unwrap().clone();
+            total += keys.len();
+
+            if keys.len() < batch_size { break; }
+        }
+
+        tracing::info!("布隆过滤器预热完成，加载 {} 个幂等键", total);
+        Ok(total)
+    }
+}
+```
+
+启动流程中调用：
+
+```rust
+// 服务启动时预热（在接受请求之前）
+gateway.idempotency_bloom
+    .warm_up(&pool, Duration::from_secs(72 * 3600))
+    .await?;
+```
+
+## 幂等键过期清理
+
+幂等键表会随时间无限增长，需要定期清理过期条目。采用 pg_cron 定时任务：
+
+```sql
+-- 安装 pg_cron 扩展（需 superuser）
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- 每小时清理超过 72 小时的幂等键
+SELECT cron.schedule(
+    'cleanup_idempotency_keys',
+    '0 * * * *',
+    $$DELETE FROM idempotency_keys WHERE created_at < NOW() - INTERVAL '72 hours'$$
+);
+```
+
+如果环境不支持 pg_cron，可在应用层实现定时清理：
+
+```rust
+impl PgEventStore {
+    /// 定期清理过期幂等键（建议每小时执行一次）
+    pub async fn cleanup_expired_keys(&self, retention: Duration) -> Result<u64> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::from_std(retention).unwrap();
+        let result = sqlx::query("DELETE FROM idempotency_keys WHERE created_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool).await
+            .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+        Ok(result.rows_affected())
+    }
+}
+```
+
+清理策略：
+- 保留时长 72 小时（覆盖客户端最长重试窗口）
+- 每小时执行一次，每次删除量可控
+- 清理不影响正确性：过期后重复命令会被 version conflict 拦截
+
+## 连接池与超时配置
+
+### 连接池大小
+
+```rust
+pub struct EventStoreConfig {
+    /// 最大连接数 = CPU 核数 × 4
+    /// 30K TPS / 单连接吞吐(~200 TPS) ≈ 150
+    pub max_connections: u32,        // 默认 128
+    /// 最小空闲连接数
+    pub min_connections: u32,        // 默认 16
+    /// 连接获取超时
+    pub acquire_timeout: Duration,   // 默认 3s
+    /// 单事务超时（防止长事务阻塞 WAL）
+    pub statement_timeout: Duration, // 默认 5s
+    /// 连接最大生命周期（防止连接泄漏）
+    pub max_lifetime: Duration,      // 默认 30min
+    /// 空闲连接回收时间
+    pub idle_timeout: Duration,      // 默认 10min
+    /// 数据库连接字符串
+    pub database_url: String,
+}
+```
+
+### 初始化
+
+```rust
+impl PgEventStore {
+    pub async fn new(config: &EventStoreConfig) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .min_connections(config.min_connections)
+            .acquire_timeout(config.acquire_timeout)
+            .max_lifetime(config.max_lifetime)
+            .idle_timeout(config.idle_timeout)
+            .after_connect(|conn, _| Box::pin(async move {
+                sqlx::query(&format!(
+                    "SET statement_timeout = '{}ms'",
+                    config.statement_timeout.as_millis()
+                ))
+                .execute(conn).await?;
+                Ok(())
+            }))
+            .connect(&config.database_url).await?;
+        Ok(Self { pool })
+    }
+}
+```
+
+### 写入重试策略
+
+| 错误类型 | 是否重试 | 说明 |
+|----------|----------|------|
+| ConnectionError | 是（1次） | 网络闪断，重试安全（事务未提交则无副作用） |
+| VersionConflict | 否 | 业务冲突，客户端决策 |
+| DuplicateCommand | 否 | 幂等拦截，正常流程 |
+| StatementTimeout | 否 | DB 负载过高，返回 503 让客户端退避重试 |
+
+### 连接池大小计算
+
+```
+目标 TPS = 30,000
+单事务延迟 ≈ 3ms（含 fsync）
+单连接 TPS = 1000ms / 3ms ≈ 333
+所需连接数 = 30,000 / 333 ≈ 90
+
+考虑突发流量和长尾延迟，建议 max_connections = 128
+```
+
+注：实际部署前应通过基准测试验证，不同硬件和网络环境下延迟差异较大。
+
+## 未来演进
+
+当前设计为单实例 PostgreSQL，后续迁移至分布式数据库时需关注：
+- `EventStore` trait 已预留 `fencing_token` 参数，集群模式下启用防脑裂检查
+- 迁移时替换 `PgEventStore` 实现即可，上层代码无需修改
+- 分片策略、CDC 拓扑等在迁移时重新规划

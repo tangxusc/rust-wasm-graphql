@@ -168,6 +168,9 @@ impl WasmEngine {
 
 Gateway 收到 GraphQL mutation 请求时，已知命令类型（从 GraphQL field name 反推）：
 
+> **注意**：以下为简化版 Gateway 代码，仅展示命令路由逻辑。
+> 完整流程（含幂等检查、关闭检查、布隆过滤器）见 [command-flow.md](./command-flow.md)。
+
 ```rust
 pub struct CommandGateway {
     runtime: Arc<VirtualActorRuntime>,
@@ -181,7 +184,7 @@ impl CommandGateway {
         let cmd_def = self.command_registry.get(&command.module, &command.command_type);
         if let Some(validate_fn) = cmd_def.and_then(|c| c.validate_fn.as_ref()) {
             let mut instance = self.wasm_pool.acquire(&command.module).await?;
-            instance.call_function(validate_fn, &[command.data.clone()])?;
+            instance.call_validate(validate_fn, &command.data)?;
             drop(instance);
         }
         // 无 validate 函数时：直接跳过，进入 Actor 处理
@@ -224,6 +227,7 @@ pub struct IncomingCommand {
     pub module: String,          // 模块名（如 "inventory"）
     pub command_type: String,    // 命令类型 kebab-case（如 "create-item"）
     pub data: Vec<u8>,           // 序列化的命令参数
+    pub validated: bool,         // 集群模式：true 表示 validate 已在源节点执行，owner 节点跳过
 }
 ```
 

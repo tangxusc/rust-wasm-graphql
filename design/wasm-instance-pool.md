@@ -110,31 +110,60 @@ impl WasmInstancePool {
 pub struct PooledInstance {
     instance: Option<WasmInstance>,
     return_to: Option<Arc<ArrayQueue<WasmInstance>>>,  // None = temporary
+    trapped: bool,  // WASM 函数是否发生 trap
 }
 
 impl PooledInstance {
     fn pooled(instance: WasmInstance, pool: Arc<ArrayQueue<WasmInstance>>) -> Self {
-        Self { instance: Some(instance), return_to: Some(pool) }
+        Self { instance: Some(instance), return_to: Some(pool), trapped: false }
     }
 
     fn temporary(instance: WasmInstance) -> Self {
-        Self { instance: Some(instance), return_to: None }
+        Self { instance: Some(instance), return_to: None, trapped: false }
     }
 
     pub fn call_function(&mut self, func_name: &str, args: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, String> {
         let inst = self.instance.as_mut().unwrap();
-        call_wasm_func_generic(&mut inst.store, &inst.instance, func_name, args)
+        match call_wasm_func_generic(&mut inst.store, &inst.instance, func_name, args) {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                self.trapped = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// 专用 validate 调用：validate-X 返回 result<_, string>，成功时无有效载荷
+    pub fn call_validate(&mut self, func_name: &str, command: &[u8]) -> Result<(), String> {
+        let inst = self.instance.as_mut().unwrap();
+        match call_wasm_func_validate(&mut inst.store, &inst.instance, func_name, command) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.trapped = true;
+                Err(e)
+            }
+        }
     }
 
     pub fn call_apply_events(&mut self, snapshot: &[u8], events: &[&[u8]]) -> Result<Vec<u8>> {
         let inst = self.instance.as_mut().unwrap();
-        call_wasm_func_apply(&mut inst.store, &inst.instance, "apply-events", snapshot, events)
+        match call_wasm_func_apply(&mut inst.store, &inst.instance, "apply-events", snapshot, events) {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                self.trapped = true;
+                Err(e)
+            }
+        }
     }
 }
 
 impl Drop for PooledInstance {
     fn drop(&mut self) {
         if let Some(mut instance) = self.instance.take() {
+            // Trap 后实例状态可能不一致，直接丢弃不归还池
+            if self.trapped {
+                return;
+            }
             instance.store.data_mut().reset();
             // 仅 pooled 实例归还池；temporary 实例直接丢弃
             if let Some(ref pool) = self.return_to {
@@ -243,6 +272,79 @@ WASM 组件模型保证实例间完全隔离：
 - reset() 清理 WASI 资源（文件描述符、环境变量等）
 
 因此实例池复用是安全的，不会产生状态泄漏。
+
+### Trap 后实例处理
+
+当 WASM 函数执行时发生 trap（如 unreachable 指令、内存越界、栈溢出），
+实例的线性内存可能处于不一致状态。Wasmtime 在 trap 后不保证 Store 的安全复用。
+
+处理策略：
+- `PooledInstance` 内部维护 `trapped: bool` 标记
+- 任何 `call_*` 方法返回错误时自动设置 `trapped = true`
+- `Drop` 时检查：`trapped` 为 true 则直接丢弃实例，不归还池
+- 池大小短暂减少后，后续请求通过 `spawn_blocking` 创建临时实例补充
+
+这意味着在 WASM 组件频繁 trap 的场景下，池会逐渐耗空，退化为每次创建临时实例。
+这是正确的行为——频繁 trap 说明组件有 bug，性能退化可作为报警信号。
+
+### 池自愈：后台定时补充
+
+偶发 trap（如输入边界 case）会导致池水位逐渐下降。后台补充任务定期检测池水位，
+低于阈值时异步预热新实例，防止池永久缩小：
+
+```rust
+impl WasmInstancePool {
+    /// 后台补充任务：定期检测池水位，低于阈值时补充
+    pub fn start_replenisher(
+        self: &Arc<Self>,
+        check_interval: Duration,       // 默认 5s
+        low_watermark: f64,             // 默认 0.75
+        max_replenish_per_tick: usize,  // 默认 4
+    ) -> JoinHandle<()> {
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(check_interval);
+            loop {
+                interval.tick().await;
+
+                let current = pool.pool.len();
+                let threshold = (pool.pool_size as f64 * low_watermark) as usize;
+
+                if current < threshold {
+                    let deficit = (pool.pool_size - current).min(max_replenish_per_tick);
+                    let engine = pool.engine.clone();
+                    let component = pool.component.clone();
+                    let linker = pool.linker.clone();
+                    let queue = pool.pool.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        for _ in 0..deficit {
+                            match Self::create_instance(&engine, &component, &linker) {
+                                Ok(inst) => { let _ = queue.push(inst); }
+                                Err(e) => {
+                                    tracing::warn!("实例补充失败: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    }).await.ok();
+
+                    tracing::debug!(
+                        "实例池 '{}' 补充完成，当前水位: {}/{}",
+                        pool.module_name, pool.pool.len(), pool.pool_size
+                    );
+                }
+            }
+        })
+    }
+}
+```
+
+补充策略说明：
+- `low_watermark = 0.75`：池水位降至初始大小 75% 以下时触发补充
+- `max_replenish_per_tick = 4`：每轮最多补充 4 个实例，防止组件持续 trap 时无限创建
+- 频繁 trap 时池水位会在"补充 → trap → 补充"间震荡，作为运维报警信号
+- 补充在 `spawn_blocking` 中执行，不阻塞 tokio worker
 
 ## 与 Virtual Actor 的集成
 
