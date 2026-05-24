@@ -22,30 +22,32 @@ Client       GraphQL      Gateway        VirtualActorRuntime     Actor(聚合)  
   │              │            │─ 幂等检查 ──────▶│                   │                 │                │
   │              │            │  (bloom+KV)      │                   │                 │                │
   │              │            │                  │                   │                 │                │
-  │              │            │─ validate-create-item() ────────────────────────────▶│                │
+  │              │            │─ validate-X() [仅当存在] ───────────────────────────▶│                │
   │              │            │◀─ Ok ───────────────────────────────────────────────│                │
   │              │            │                  │                   │                 │                │
   │              │            │─ send(agg_id) ──▶│                   │                 │                │
   │              │            │                  │── 查找/激活 Actor ▶│                 │                │
   │              │            │                  │   (透明寻址)       │                 │                │
   │              │            │                  │                   │                 │                │
-  │              │            │                  │                   │─ handle-create-item(state) ───▶│
+  │              │            │                  │                   │─ handle-X(state) ────────────▶│
   │              │            │                  │                   │◀─ new_events ─────────────────│
   │              │            │                  │                   │                 │                │
   │              │            │                  │                   │── persist(同步等待) ────────────▶│
   │              │            │                  │                   │◀── ack(已落盘) ─────────────────│
   │              │            │                  │                   │                 │                │
-  │              │            │                  │                   │── apply locally ─┐               │
-  │              │            │                  │                   │   state += events│               │
-  │              │            │                  │                   │◀─────────────────┘               │
+  │              │            │                  │                   │── apply(自定义或默认)─┐          │
+  │              │            │                  │                   │   state += events    │          │
+  │              │            │                  │                   │◀─────────────────────┘          │
   │              │            │                  │                   │                 │                │
   │◀── Result ──│◀───────────│◀─────────────────│◀── Ok(version) ──│                 │                │
 ```
 
-关键顺序：**validate-X（Gateway 前置） → persist → ack → apply locally → 响应客户端**
+关键顺序：**validate-X（Gateway 前置，可选） → persist → ack → apply（自定义或默认策略） → 响应客户端**
 
-validate-X 在 Gateway 层前置执行，不依赖聚合状态，冷聚合无需激活即可拒绝格式错误的请求。
-事件先落盘，再更新内存状态。即使 apply 过程中崩溃，重新激活时从 DB 重建即可恢复正确状态。
+- validate-X 在 Gateway 层前置执行（如果存在），不依赖聚合状态，冷聚合无需激活即可拒绝格式错误的请求
+- 无 validate-X 时 Gateway 跳过校验，直接路由到 Actor
+- apply 阶段：有自定义 apply-events 则调用 WASM 组件，无则使用 Host 默认策略（JSON 深度合并）
+- 事件先落盘，再更新内存状态。即使 apply 过程中崩溃，重新激活时从 DB 重建即可恢复正确状态
 
 ## Command Gateway（入口层）
 
@@ -54,6 +56,7 @@ pub struct CommandGateway {
     runtime: Arc<VirtualActorRuntime>,
     idempotency_bloom: RollingBloomFilter,
     wasm_pool: Arc<WasmPoolManager>,
+    command_registry: CommandRegistry,  // 启动时缓存的命令定义
 }
 
 impl CommandGateway {
@@ -65,11 +68,14 @@ impl CommandGateway {
             }
         }
 
-        // 2. 前置 validate-X（按命令类型路由，不依赖聚合状态）
-        let validate_fn = format!("validate-{}", command.command_type);
-        let mut instance = self.wasm_pool.acquire(&command.module).await?;
-        instance.call_function(&validate_fn, &[command.data.clone()])?;
-        drop(instance);
+        // 2. 前置 validate-X（仅当该命令有 validate 函数时执行）
+        let cmd_def = self.command_registry.get(&command.module, &command.command_type);
+        if let Some(validate_fn) = cmd_def.and_then(|c| c.validate_fn.as_ref()) {
+            let mut instance = self.wasm_pool.acquire(&command.module).await?;
+            instance.call_function(validate_fn, &[command.data.clone()])?;
+            drop(instance);
+        }
+        // 无 validate 函数时：直接跳过，进入 Actor 处理
 
         // 3. 透明寻址：运行时自动激活/路由
         //    幂等键在 Event Store 同一事务中写入，无窗口丢失风险
@@ -200,9 +206,16 @@ impl VirtualActorRuntime {
         let state = if events.is_empty() {
             base_state
         } else {
-            let mut instance = self.wasm_pool.acquire(module).await?;
             let event_data: Vec<&[u8]> = events.iter().map(|e| e.data.as_slice()).collect();
-            instance.call_apply_events(&base_state, &event_data)?
+            if self.has_custom_apply_events(module) {
+                // 有自定义 apply-events：调用 WASM 组件实现
+                let mut instance = self.wasm_pool.acquire(module).await?;
+                instance.call_apply_events(&base_state, &event_data)?
+            } else {
+                // 无 apply-events：使用 Host 默认策略（JSON 深度合并）
+                let event_vecs: Vec<Vec<u8>> = events.iter().map(|e| e.data.clone()).collect();
+                default_apply_events(&base_state, &event_vecs)?
+            }
         };
 
         Ok((state, version))
@@ -245,6 +258,7 @@ pub struct VirtualActor {
     module_name: String,
     state: Vec<u8>,             // 内存中的当前状态（始终与 DB 一致）
     version: u64,               // 已持久化的版本号
+    has_custom_apply: bool,     // 是否有自定义 apply-events 实现
     wasm_pool: Arc<WasmPoolManager>,
     event_store: Arc<dyn EventStore>,
     snapshot_store: Arc<dyn SnapshotStore>,
@@ -289,8 +303,7 @@ impl VirtualActor {
 
     /// 处理单个命令（强一致：持久化后才响应）
     async fn process_command(&mut self, cmd: IncomingCommand) -> Result<CommandResult> {
-        // 注意：validate-X 已在 Gateway 层前置执行，此处不再重复调用
-        // 这样冷聚合无需激活即可拒绝格式错误的请求
+        // 注意：validate-X 已在 Gateway 层前置执行（如果存在），此处不再重复调用
 
         // 1. WASM handle-X（按命令类型路由，基于内存中的当前状态决策）
         let handle_fn = format!("handle-{}", cmd.command_type);
@@ -316,9 +329,15 @@ impl VirtualActor {
         ).await?;
 
         // 3. DB 已确认 → 安全更新内存状态
-        let mut inst = self.wasm_pool.acquire(&self.module_name).await?;
         let event_refs: Vec<&[u8]> = new_events.iter().map(|e| e.as_slice()).collect();
-        self.state = inst.call_apply_events(&self.state, &event_refs)?;
+        self.state = if self.has_custom_apply {
+            // 有自定义 apply-events：调用 WASM 组件实现
+            let mut inst = self.wasm_pool.acquire(&self.module_name).await?;
+            inst.call_apply_events(&self.state, &event_refs)?
+        } else {
+            // 无 apply-events：使用 Host 默认策略（JSON 深度合并）
+            default_apply_events(&self.state, &new_events)?
+        };
         self.version += new_events.len() as u64;
 
         // 4. 异步快照判断（快照丢失不影响正确性）
@@ -507,7 +526,7 @@ pub struct VirtualActorConfig {
 
 | 场景 | 处理方式 | 数据安全 |
 |------|----------|----------|
-| validate 失败 | 返回 400，无副作用 | 安全 |
+| validate 失败（仅当存在时） | 返回 400，无副作用 | 安全 |
 | handle 失败（业务拒绝） | 返回领域错误，状态不变 | 安全 |
 | persist 失败（DB 不可用） | 返回 503，内存状态不变 | 安全 |
 | persist 成功但 apply 崩溃 | 重新激活时从 DB 重建 | 安全 |
