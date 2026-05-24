@@ -326,13 +326,25 @@ WASM 边界使用 `list<u8>` 传递结构化数据，内部序列化格式由组
 
 ```rust
 // 每个命令独立的参数结构（与 WIT record 对应）
+// 使用 kebab-case 反序列化，与 Host 传递的 JSON key 格式一致
+//
+// 命名转换链：
+//   WIT record: item-name (kebab-case)
+//   → GraphQL: itemName (camelCase)
+//   → Host 序列化: "item-name" (kebab-case，Host 负责 camelCase → kebab-case 转换)
+//   → WASM 反序列化: #[serde(rename_all = "kebab-case")]
+//
+// 单词字段（如 name、quantity）无需 rename，多词字段必须使用 kebab-case rename。
+
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct CreateItemParams {
     pub name: String,
     pub quantity: u32,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct AdjustStockParams {
     pub delta: i32,
 }

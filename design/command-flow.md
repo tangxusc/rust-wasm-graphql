@@ -108,6 +108,8 @@ pub struct VirtualActorRuntime {
     active: DashMap<String, ActorHandle>,
     /// 激活锁：防止同一聚合并发激活（per-key 粒度）
     activation_locks: DashMap<String, Arc<Mutex<()>>>,
+    /// 模块暂停标记：热更新期间暂停特定模块的请求处理
+    paused_modules: DashMap<String, ()>,
     /// 全局递增的 Actor generation（用于防止驱逐竞态下误删新 Actor）
     next_generation: AtomicU64,
     /// 内存预算
@@ -120,6 +122,8 @@ pub struct VirtualActorRuntime {
     event_store: Arc<dyn EventStore>,
     snapshot_store: Arc<dyn SnapshotStore>,
     wasm_pool: Arc<WasmPoolManager>,
+    /// 激活钩子：集群模式注入 lease 获取逻辑，单机模式为 NoopHook
+    activation_hook: Arc<dyn ActivationHook>,
 }
 
 impl VirtualActorRuntime {
@@ -129,8 +133,26 @@ impl VirtualActorRuntime {
         aggregate_id: &str,
         command: IncomingCommand,
     ) -> Result<CommandResult> {
+        // 模块暂停检查（热更新期间拒绝该模块请求）
+        if self.paused_modules.contains_key(&command.module) {
+            return Err(Error::service_unavailable(
+                "模块正在热更新，请稍后重试"
+            ));
+        }
         let handle = self.get_or_activate(aggregate_id, &command.module).await?;
         handle.send(command).await
+    }
+
+    /// 暂停指定模块的请求处理（热更新使用）
+    pub fn pause_module(&self, module: &str) {
+        self.paused_modules.insert(module.to_string(), ());
+        tracing::info!("模块 '{module}' 已暂停，新请求将被拒绝");
+    }
+
+    /// 恢复指定模块的请求处理
+    pub fn resume_module(&self, module: &str) {
+        self.paused_modules.remove(module);
+        tracing::info!("模块 '{module}' 已恢复");
     }
 
     /// 获取已激活的 Actor，或按需激活（防止并发激活同一聚合）
@@ -244,6 +266,10 @@ impl VirtualActorRuntime {
     /// Actor 处理完 mailbox 中所有待处理命令后收到 Deactivate，保存快照并退出，
     /// 退出时通过 exit_tx 通知驱逐方，驱逐方确认后从 active 中移除。
     /// 同步等待确保 activate() 中的 active.len() 检查准确反映可用槽位。
+    ///
+    /// 超时保护：如果 Actor 在 5 秒内未退出，**不移除 active 条目**，仅记录告警。
+    /// 旧 Actor 最终会自行退出并从 active 移除。超时期间该聚合不可用（新请求会
+    /// 命中已有 handle 但 Actor 可能正在退出），但避免了双 Actor 同时运行的风险。
     async fn evict_one(&self) -> bool {
         let now = now_millis();
         let min_idle_ms = self.min_evict_idle.as_millis() as u64;
@@ -251,9 +277,7 @@ impl VirtualActorRuntime {
         let candidate = self.active.iter()
             .filter(|entry| {
                 let handle = entry.value();
-                // 保护条件：正在处理消息或有待处理消息的 Actor 不可驱逐
                 !handle.is_busy()
-                // 保护条件：未达到最小空闲时间的 Actor 不可驱逐
                 && (now - handle.last_active()) > min_idle_ms
             })
             .min_by_key(|entry| entry.value().last_active())
@@ -262,16 +286,24 @@ impl VirtualActorRuntime {
         if let Some(id) = candidate {
             if let Some(handle) = self.active.get(&id) {
                 let generation = handle.generation();
-                // 发送 Deactivate 并同步等待 Actor 退出
                 let exit_rx = handle.send_deactivate_and_wait().await;
                 drop(handle);
                 // 等待 Actor 完成快照保存并退出（带超时保护）
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    exit_rx,
-                ).await;
-                // 仅移除同一 generation 的条目，防止驱逐期间新 Actor 被误删
-                self.active.remove_if(&id, |_, h| h.generation() == generation);
+                match tokio::time::timeout(Duration::from_secs(5), exit_rx).await {
+                    Ok(_) => {
+                        // Actor 正常退出，安全移除
+                        self.active.remove_if(&id, |_, h| h.generation() == generation);
+                    }
+                    Err(_) => {
+                        // 超时：不移除 active 条目，避免双 Actor 风险
+                        // Actor 最终退出时会通过 spawn 中的 remove_if 自行清理
+                        tracing::warn!(
+                            "[{}] 驱逐超时（5s），等待 Actor 自行退出",
+                            id
+                        );
+                        return false;
+                    }
+                }
             }
             true
         } else {
@@ -644,6 +676,69 @@ pub struct VirtualActorConfig {
     pub max_evict_per_tick: usize,       // 每轮驱逐上限（默认 10）
     pub max_evict_retries: usize,        // 激活时驱逐最大重试次数（默认 3）
     pub shutdown_timeout: Duration,      // 优雅关闭超时（默认 30 秒）
+}
+```
+
+## ActivationHook（集群模式扩展点）
+
+```rust
+/// Actor 激活钩子：允许集群模式在激活流程中注入 lease 获取和 fencing token 设置
+/// 单机模式使用 NoopActivationHook，集群模式使用 LeaseActivationHook
+#[async_trait]
+pub trait ActivationHook: Send + Sync {
+    /// Actor 激活前调用，返回需要注入到 Actor 的上下文
+    /// 集群模式：获取 lease，返回 fencing_token 和 lease_guard
+    /// 单机模式：直接返回 None
+    async fn on_activating(
+        &self,
+        aggregate_id: &str,
+        module: &str,
+    ) -> Result<ActivationContext>;
+
+    /// Actor 休眠后调用
+    /// 集群模式：释放 lease
+    /// 单机模式：无操作
+    async fn on_deactivated(&self, aggregate_id: &str);
+}
+
+pub struct ActivationContext {
+    /// 集群模式 Some(token)，单机模式 None
+    pub fencing_token: Option<u64>,
+    /// 集群模式 Some(guard)，Actor 持有引用用于检查 lease 有效性
+    pub lease_guard: Option<Arc<LeaseGuard>>,
+}
+
+/// 单机模式：无操作
+pub struct NoopActivationHook;
+
+#[async_trait]
+impl ActivationHook for NoopActivationHook {
+    async fn on_activating(&self, _: &str, _: &str) -> Result<ActivationContext> {
+        Ok(ActivationContext { fencing_token: None, lease_guard: None })
+    }
+    async fn on_deactivated(&self, _: &str) {}
+}
+```
+
+VirtualActorRuntime 在 `activate()` 中调用 hook：
+
+```rust
+async fn activate(&self, aggregate_id: &str, module: &str) -> Result<ActorHandle> {
+    // ... 内存压力检查 ...
+
+    // 调用激活钩子（集群模式获取 lease + fencing token）
+    let ctx = self.activation_hook.on_activating(aggregate_id, module).await?;
+
+    let (state, version) = self.recover_state(aggregate_id, module).await?;
+
+    let (handle, actor) = VirtualActor::new(
+        // ... 其他参数 ...
+        ctx.fencing_token,      // 注入 fencing_token
+        ctx.lease_guard,        // 注入 lease_guard 引用
+    );
+
+    // ... spawn actor ...
+    Ok(handle)
 }
 ```
 

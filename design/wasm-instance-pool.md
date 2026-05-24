@@ -273,8 +273,51 @@ WASM 组件模型保证实例间完全隔离：
 - 池大小短暂减少后，后续请求通过 `spawn_blocking` 创建临时实例补充
 
 这意味着在 WASM 组件频繁 trap 的场景下，池会逐渐耗空，开始拒绝请求（503）。
-这是正确的行为——频繁 trap 说明组件有 bug，请求拒绝可作为报警信号，
-配合后台 replenisher 补充实例实现自愈。
+配合熔断器机制，频繁 trap 时自动停止分配实例，避免无效 CPU 消耗。
+
+### 熔断器（Circuit Breaker）
+
+当某模块连续 trap 率超过阈值时，熔断器自动切断该模块的请求处理，
+避免"补充 → trap → 补充"的无效循环消耗 CPU。
+
+```rust
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+/// 熔断器状态
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CircuitState {
+    Closed = 0,    // 正常：允许所有请求
+    Open = 1,      // 熔断：拒绝所有请求
+    HalfOpen = 2,  // 半开：允许少量探测请求
+}
+
+pub struct CircuitBreaker {
+    state: AtomicU8,
+    /// 滑动窗口内的 trap 计数
+    trap_count: AtomicU64,
+    /// 滑动窗口内的总调用计数
+    call_count: AtomicU64,
+    /// 窗口起始时间（毫秒）
+    window_start: AtomicU64,
+    /// 半开状态下已放行的探测请求数
+    half_open_permits: AtomicU64,
+    config: CircuitBreakerConfig,
+}
+
+pub struct CircuitBreakerConfig {
+    /// 滑动窗口大小（默认 30 秒）
+    pub window_duration: Duration,
+    /// 触发熔断的 trap 率阈值（默认 0.5，即 50%）
+    pub trip_threshold: f64,
+    /// 触发熔断的最小调用次数（防止低流量误判，默认 10）
+    pub min_calls_to_trip: u64,
+    /// 熔断持续时间（之后进入半开，默认 60 秒）
+    pub open_duration: Duration,
+    /// 半开状态允许的探测请求数（默认 3）
+    pub half_open_max_permits: u64,
+}
+```
 
 ### 池自愈：后台定时补充
 
@@ -332,8 +375,117 @@ impl WasmInstancePool {
 补充策略说明：
 - `low_watermark = 0.75`：池水位降至初始大小 75% 以下时触发补充
 - `max_replenish_per_tick = 4`：每轮最多补充 4 个实例，防止组件持续 trap 时无限创建
-- 频繁 trap 时池水位会在"补充 → trap → 补充"间震荡，作为运维报警信号
+- 熔断器 Open 状态时 replenisher 暂停补充，避免无效 CPU 消耗
 - 补充在 `spawn_blocking` 中执行，不阻塞 tokio worker
+
+### 熔断器与实例池集成
+
+```rust
+impl WasmInstancePool {
+    /// 从池中获取实例（熔断器检查 → 池获取）
+    pub async fn acquire(&self) -> Result<PooledInstance> {
+        // 熔断器检查
+        match self.circuit_breaker.state() {
+            CircuitState::Open => {
+                return Err(Error::circuit_open(&self.module_name));
+            }
+            CircuitState::HalfOpen => {
+                // 半开状态：仅允许有限探测请求
+                if !self.circuit_breaker.try_half_open_permit() {
+                    return Err(Error::circuit_open(&self.module_name));
+                }
+            }
+            CircuitState::Closed => {}
+        }
+
+        match self.pool.pop() {
+            Some(instance) => Ok(PooledInstance::pooled(instance, self.pool.clone(), &self.circuit_breaker)),
+            None => Err(Error::pool_exhausted(&self.module_name)),
+        }
+    }
+
+    /// 记录调用结果，更新熔断器状态
+    fn record_outcome(&self, trapped: bool) {
+        self.circuit_breaker.record_call();
+        if trapped {
+            self.circuit_breaker.record_trap();
+        }
+        // 检查是否需要状态转换
+        self.circuit_breaker.evaluate();
+    }
+}
+
+impl CircuitBreaker {
+    pub fn state(&self) -> CircuitState {
+        // Open 状态超过 open_duration 后自动转为 HalfOpen
+        let s = self.state.load(Ordering::Acquire);
+        if s == CircuitState::Open as u8 {
+            let elapsed = now_millis() - self.opened_at.load(Ordering::Relaxed);
+            if elapsed > self.config.open_duration.as_millis() as u64 {
+                self.state.store(CircuitState::HalfOpen as u8, Ordering::Release);
+                self.half_open_permits.store(0, Ordering::Relaxed);
+                return CircuitState::HalfOpen;
+            }
+        }
+        unsafe { std::mem::transmute(s) }
+    }
+
+    /// 评估是否需要状态转换
+    pub fn evaluate(&self) {
+        match self.state() {
+            CircuitState::Closed => {
+                let calls = self.call_count.load(Ordering::Relaxed);
+                let traps = self.trap_count.load(Ordering::Relaxed);
+                if calls >= self.config.min_calls_to_trip {
+                    let trap_rate = traps as f64 / calls as f64;
+                    if trap_rate >= self.config.trip_threshold {
+                        self.trip();
+                    }
+                }
+            }
+            CircuitState::HalfOpen => {
+                let permits = self.half_open_permits.load(Ordering::Relaxed);
+                if permits >= self.config.half_open_max_permits {
+                    // 探测请求全部成功（无新 trap）→ 恢复
+                    self.reset();
+                }
+            }
+            CircuitState::Open => {} // 等待超时自动转 HalfOpen
+        }
+    }
+
+    fn trip(&self) {
+        self.state.store(CircuitState::Open as u8, Ordering::Release);
+        self.opened_at.store(now_millis(), Ordering::Relaxed);
+        tracing::error!(
+            "熔断器触发：模块 '{}' trap 率过高，已停止接受请求",
+            self.module_name
+        );
+    }
+
+    fn reset(&self) {
+        self.state.store(CircuitState::Closed as u8, Ordering::Release);
+        self.trap_count.store(0, Ordering::Relaxed);
+        self.call_count.store(0, Ordering::Relaxed);
+        tracing::info!("熔断器恢复：模块 '{}' 已恢复正常", self.module_name);
+    }
+}
+```
+
+熔断器状态转换：
+
+```
+     trap 率 < 阈值                    超过 open_duration
+  ┌──────────────────┐              ┌──────────────────┐
+  │                  │              │                  │
+  ▼                  │              ▼                  │
+Closed ──────────── Open ─────────── HalfOpen
+  ▲    trap率≥阈值         自动超时        │
+  │                                        │ 探测成功
+  └────────────────────────────────────────┘
+                                           │ 探测失败
+                                           └──→ Open
+```
 
 ## 与 Virtual Actor 的集成
 

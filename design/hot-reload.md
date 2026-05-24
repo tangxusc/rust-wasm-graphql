@@ -101,24 +101,28 @@ async fn admin_reload(
     ├── 3. 创建新实例池（预热）
     │      - 新池与旧池并存
     │
-    ├── 4. 休眠该类型所有活跃 Actor
-    │      - 发送 Deactivate，等待退出
-    │      - 确保无旧 Actor 使用新池（消除新旧版本混合处理窗口）
+    ├── 4. 设置模块暂停标记（该模块新请求返回 503）
+    │      - 防止步骤 5-7 期间新请求用旧池重新激活 Actor
     │
-    ├── 5. 清除该聚合类型的所有快照
+    ├── 5. 休眠该类型所有活跃 Actor
+    │      - 发送 Deactivate，等待退出
+    │
+    ├── 6. 清除该聚合类型的所有快照
     │      - 下次激活时从事件全量重建
     │
-    ├── 6. 原子切换 WasmPoolManager 中的模块引用
+    ├── 7. 原子切换 WasmPoolManager 中的模块引用
     │      - 新请求使用新池
-    │      - 旧池中正在使用的实例继续完成当前调用（此时应已无活跃调用）
     │
-    ├── 7. 等待旧池所有实例归还后释放
+    ├── 8. 清除模块暂停标记（恢复接受请求）
     │
-    └── 8. 更新 GraphQL schema（如果命令列表变化）
+    ├── 9. 等待旧池所有实例归还后释放
+    │
+    └── 10. 更新 GraphQL schema（如果命令列表变化）
 ```
 
-> **设计说明**：步骤 4（休眠）在步骤 6（切换池）之前执行，确保不存在"旧 Actor 内存状态 + 新池实例"
-> 的混合处理窗口。旧 Actor 休眠后，新请求到达时会用新池重新激活，状态从事件全量重建，保证一致性。
+> **设计说明**：步骤 4 设置暂停标记后，该模块的新请求在 Gateway 层即被拒绝（503），
+> 客户端通过退避重试即可在步骤 8 后正常处理。暂停窗口通常 < 1 秒（休眠 + 切换池），
+> 彻底消除了"旧池重新激活刚休眠 Actor"的竞态窗口。
 
 ### 实现
 
@@ -139,16 +143,22 @@ impl HotReloadWatcher {
             self.pool_size,
         )?;
 
-        // 3. 先休眠所有该类型 Actor（消除新旧版本混合处理窗口）
+        // 3. 暂停该模块（新请求返回 503，防止竞态窗口内旧池重新激活 Actor）
+        self.actor_runtime.pause_module(&module_name);
+
+        // 4. 休眠所有该类型 Actor + 清除快照
         self.actor_runtime.on_module_upgrade(&module_name).await?;
 
-        // 4. 原子切换池（此时无活跃 Actor 使用旧池）
+        // 5. 原子切换池（此时无活跃 Actor，且新请求被暂停标记拦截）
         {
             let mut manager = self.pool_manager.write().await;
             manager.replace_pool(&module_name, Arc::new(new_pool));
         }
 
-        // 5. 更新 GraphQL schema（如果需要）
+        // 6. 恢复该模块（新请求使用新池）
+        self.actor_runtime.resume_module(&module_name);
+
+        // 7. 更新 GraphQL schema（如果需要）
         self.maybe_rebuild_schema(&module_name).await?;
 
         tracing::info!("模块 {module_name} 热更新完成");
@@ -173,7 +183,7 @@ impl HotReloadWatcher {
 
 ## 兼容性检查
 
-### 向后兼容规则
+### 向后兼容规则（旧事件 → 新版本 apply-events）
 
 | 变更类型 | 是否兼容 | 说明 |
 |----------|----------|------|
@@ -183,6 +193,60 @@ impl HotReloadWatcher {
 | 修改命令参数（删除字段/改类型） | **不兼容** | 旧客户端请求会失败 |
 | 修改 apply-events 逻辑 | 兼容 | 事件格式不变即可 |
 | 新增事件类型 | 兼容 | apply-events 需处理新类型 |
+
+### 前向兼容约定（新事件 → 旧版本 apply-events，灰度回滚安全）
+
+**强制约束：新版本产出的事件必须能被旧版本 apply-events 安全处理。**
+
+灰度发布期间，新版本 `handle-X` 可能产出新格式事件。如果灰度回滚，旧版本
+`apply-events` 需要重放这些新事件。因此新版本的事件格式变更必须满足前向兼容：
+
+| 事件变更类型 | 前向兼容？ | 要求 |
+|-------------|-----------|------|
+| 新增事件字段 | 是 | 旧版本 apply-events 必须忽略未知字段（禁用 `deny_unknown_fields`） |
+| 新增事件类型 | 需处理 | 旧版本 apply-events 必须有 fallback 分支（忽略或 no-op） |
+| 修改字段类型 | **不兼容** | 禁止在灰度中进行，必须用滚动重启 |
+| 删除事件字段 | **不兼容** | 禁止在灰度中进行 |
+
+**开发者必须遵守的规则**：
+
+1. **禁用 `deny_unknown_fields`**：所有事件反序列化结构体不得使用 `#[serde(deny_unknown_fields)]`
+2. **事件枚举必须有 fallback 分支**：`apply-events` 中的事件类型匹配必须包含 `_ => { /* 忽略未知事件类型 */ }` 分支
+3. **破坏性事件变更禁止灰度**：修改字段类型或删除字段时，必须使用滚动重启而非灰度发布
+
+```rust
+// 正确示例：前向兼容的 apply-events 实现
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum DomainEvent {
+    ItemCreated { name: String, quantity: u32, /* 新字段自动忽略 */ },
+    StockAdjusted { delta: i32, new_quantity: u32 },
+    #[serde(other)]  // 未知事件类型 fallback，灰度回滚安全
+    Unknown,
+}
+
+fn apply_events(state: &mut State, event: &DomainEvent) {
+    match event {
+        DomainEvent::ItemCreated { .. } => { /* ... */ }
+        DomainEvent::StockAdjusted { .. } => { /* ... */ }
+        DomainEvent::Unknown => { /* 忽略未知事件，灰度回滚安全 */ }
+    }
+}
+```
+
+**灰度前的兼容性校验**（Host 自动执行）：
+
+```rust
+impl HotReloadWatcher {
+    /// 灰度发布前检查前向兼容性
+    fn check_forward_compatibility(&self, module: &str, new_component: &Component) -> Result<()> {
+        // 如果新版本新增了事件类型，检查旧版本 apply-events 是否有 fallback 分支
+        // （通过沙箱试运行：用新版本 handle 产出事件，用旧版本 apply-events 处理）
+        // 失败则拒绝灰度，建议使用滚动重启
+        Ok(())
+    }
+}
+```
 
 ### 兼容性检查实现
 

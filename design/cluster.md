@@ -536,73 +536,90 @@ pub enum RateLimitStrategy {
 }
 ```
 
-## ClusterVirtualActorRuntime（集群模式包装层）
+## ClusterVirtualActorRuntime（基于 ActivationHook 的集群集成）
 
-单机模式的 `VirtualActorRuntime` 不感知 lease，集群模式通过包装层在外层处理 lease 获取和 fencing token 设置，
-明确两种模式的集成路径。
+集群模式通过 `ActivationHook` trait（定义见 [command-flow.md](./command-flow.md#activationhook集群模式扩展点)）
+注入 lease 获取和 fencing token 设置逻辑，无需包装层，职责边界清晰。
 
 ```rust
-/// 集群模式包装层：在单机 VirtualActorRuntime 外层处理 lease 和路由
-pub struct ClusterVirtualActorRuntime {
-    inner: Arc<VirtualActorRuntime>,
+/// 集群模式的 ActivationHook 实现：在 Actor 激活时获取 lease，休眠时释放
+pub struct LeaseActivationHook {
     lease_manager: Arc<ActorLease>,
     /// aggregate_id → LeaseGuard（活跃 Actor 持有的 lease）
     active_leases: DashMap<String, Arc<LeaseGuard>>,
 }
 
-impl ClusterVirtualActorRuntime {
-    /// 集群模式的透明寻址：获取 lease → 激活 Actor → 设置 fencing token
-    pub async fn send(
+#[async_trait]
+impl ActivationHook for LeaseActivationHook {
+    async fn on_activating(
         &self,
         aggregate_id: &str,
-        command: IncomingCommand,
-    ) -> Result<CommandResult> {
-        // 1. 确保持有该聚合的 lease
-        let lease_guard = self.ensure_lease(aggregate_id).await?;
-
-        // 2. 检查 lease 是否仍然有效（续约未失败）
-        if !lease_guard.is_valid() {
-            self.active_leases.remove(aggregate_id);
-            return Err(Error::lease_expired("Lease 已失效，请重试"));
-        }
-
-        // 3. 委托给内部 Runtime 处理（Actor 内部使用 fencing_token 写入 Event Store）
-        self.inner.send(aggregate_id, command).await
+        _module: &str,
+    ) -> Result<ActivationContext> {
+        // 获取或复用 lease
+        let guard = self.ensure_lease(aggregate_id).await?;
+        Ok(ActivationContext {
+            fencing_token: Some(guard.fencing_token()),
+            lease_guard: Some(guard),
+        })
     }
 
+    async fn on_deactivated(&self, aggregate_id: &str) {
+        // 释放 lease（LeaseGuard Drop 时自动释放）
+        self.active_leases.remove(aggregate_id);
+    }
+}
+
+impl LeaseActivationHook {
     /// 确保持有聚合的 lease（已持有则复用，未持有则获取）
     async fn ensure_lease(&self, aggregate_id: &str) -> Result<Arc<LeaseGuard>> {
         if let Some(guard) = self.active_leases.get(aggregate_id) {
             if guard.is_valid() {
                 return Ok(guard.clone());
             }
-            // lease 已失效，移除并重新获取
             drop(guard);
             self.active_leases.remove(aggregate_id);
         }
 
-        // 获取新 lease
         let guard = Arc::new(
             self.lease_manager.acquire_for(aggregate_id).await?
         );
         self.active_leases.insert(aggregate_id.to_string(), guard.clone());
         Ok(guard)
     }
+}
+```
 
-    /// Actor 激活时的扩展：设置 fencing_token 到 Actor 实例
-    /// 由 VirtualActorRuntime 的 activate 回调触发
-    pub fn on_actor_activated(&self, aggregate_id: &str, actor: &mut VirtualActor) {
-        if let Some(guard) = self.active_leases.get(aggregate_id) {
-            actor.fencing_token = Some(guard.fencing_token());
-        }
-    }
+### VirtualActor 中的 lease 有效性检查
 
-    /// Actor 休眠时释放 lease
-    pub async fn on_actor_deactivated(&self, aggregate_id: &str) {
-        if let Some((_, guard)) = self.active_leases.remove(aggregate_id) {
-            // LeaseGuard Drop 时自动释放 lease
-            drop(guard);
+Actor 持有 `lease_guard: Option<Arc<LeaseGuard>>` 引用（通过 ActivationContext 注入），
+在处理命令时检查 lease 是否仍然有效：
+
+```rust
+impl VirtualActor {
+    async fn process_command(&mut self, cmd: IncomingCommand) -> Result<CommandResult> {
+        // 集群模式：写入前检查 lease 是否仍然有效
+        if let Some(ref guard) = self.lease_guard {
+            if !guard.is_valid() {
+                self.poison_and_deactivate().await;
+                return Err(Error::lease_expired(
+                    "Lease 续约失败，Actor 已失效，请重试"
+                ));
+            }
         }
+
+        // ... validate, handle ...
+
+        // 持久化时携带 fencing_token（集群模式 Some，单机模式 None）
+        self.event_store.append_with_idempotency(
+            &self.aggregate_id,
+            &events_to_persist,
+            self.version,
+            &cmd.command_id,
+            self.fencing_token,  // 由 ActivationHook 注入
+        ).await?;
+
+        // ...
     }
 }
 ```
@@ -610,29 +627,18 @@ impl ClusterVirtualActorRuntime {
 ### 单机模式与集群模式的切换
 
 ```rust
-/// 统一的 ActorRuntime trait，上层代码无需感知部署模式
-#[async_trait]
-pub trait ActorRuntime: Send + Sync {
-    async fn send(&self, aggregate_id: &str, command: IncomingCommand) -> Result<CommandResult>;
-    async fn graceful_shutdown(&self, timeout: Duration);
-}
-
-/// 单机模式：直接使用 VirtualActorRuntime
-impl ActorRuntime for VirtualActorRuntime { /* ... */ }
-
-/// 集群模式：通过 ClusterVirtualActorRuntime 包装
-impl ActorRuntime for ClusterVirtualActorRuntime { /* ... */ }
-
-/// 启动时根据配置选择模式
-pub fn create_runtime(config: &AppConfig) -> Arc<dyn ActorRuntime> {
-    if let Some(cluster_config) = &config.cluster {
-        Arc::new(ClusterVirtualActorRuntime::new(
-            config.actor_config.clone(),
-            cluster_config.clone(),
+/// 启动时根据配置选择 ActivationHook，注入到 VirtualActorRuntime
+pub fn create_runtime(config: &AppConfig) -> Arc<VirtualActorRuntime> {
+    let hook: Arc<dyn ActivationHook> = if let Some(cluster_config) = &config.cluster {
+        Arc::new(LeaseActivationHook::new(
+            cluster_config.lease_ttl,
+            cluster_config.etcd_endpoints.clone(),
         ))
     } else {
-        Arc::new(VirtualActorRuntime::new(config.actor_config.clone()))
-    }
+        Arc::new(NoopActivationHook)
+    };
+
+    Arc::new(VirtualActorRuntime::new(config.actor_config.clone(), hook))
 }
 ```
 
@@ -640,8 +646,9 @@ pub fn create_runtime(config: &AppConfig) -> Arc<dyn ActorRuntime> {
 
 | 组件 | 单机模式 | 集群模式 |
 |------|----------|----------|
-| Gateway | `VirtualActorRuntime::send()` | `ClusterVirtualActorRuntime::send()` |
-| Actor 激活 | 直接从快照+事件恢复 | 先获取 lease → 恢复 → 设置 fencing_token |
-| Actor 休眠 | 保存快照 | 保存快照 → 释放 lease |
+| ActivationHook | `NoopActivationHook`（无操作） | `LeaseActivationHook`（获取/释放 lease） |
+| Actor 激活 | 直接从快照+事件恢复 | Hook 获取 lease → 恢复 → 注入 fencing_token + lease_guard |
+| Actor 休眠 | 保存快照 | 保存快照 → Hook 释放 lease |
 | Event Store 写入 | `fencing_token = None` | `fencing_token = Some(token)` |
-| Actor 崩溃恢复 | 下次访问自动重新激活 | 重新获取 lease → 重新激活 |
+| Actor lease 失效 | 不适用 | Actor 检测 lease_guard.is_valid() → poison + 退出 |
+| Actor 崩溃恢复 | 下次访问自动重新激活 | Hook 重新获取 lease → 重新激活 |

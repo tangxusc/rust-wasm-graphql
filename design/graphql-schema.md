@@ -81,7 +81,16 @@ mutation {
 const COMMAND_ID_FIELD: &str = "command-id";
 const AGGREGATE_ID_FIELD: &str = "aggregate-id";
 
-/// 从 GraphQL 参数中提取元数据，剩余参数序列化为命令数据
+/// 从 GraphQL 参数中提取元数据，剩余参数转为 kebab-case 后序列化为命令数据
+///
+/// 命名转换链：
+///   WIT record 字段: item-name (kebab-case)
+///   → GraphQL 参数: itemName (camelCase)
+///   → Host 序列化: "item-name" (kebab-case，与 WIT 定义一致)
+///   → WASM 组件反序列化: #[serde(rename_all = "kebab-case")] 或逐字段 rename
+///
+/// Host 负责将 GraphQL camelCase 转回 WIT kebab-case，确保 WASM 组件
+/// 收到的 JSON key 与 WIT record 字段名一致，消除命名约定的隐式耦合。
 pub fn extract_command_meta(
     args: &IndexMap<Name, Value>,
 ) -> Result<IncomingCommand> {
@@ -97,18 +106,46 @@ pub fn extract_command_meta(
         .ok_or(Error::missing_field("aggregateId"))?
         .to_string();
 
-    let domain_args: IndexMap<Name, Value> = args
+    // 领域参数：key 从 camelCase 转为 kebab-case（与 WIT record 字段名一致）
+    let domain_args: IndexMap<String, Value> = args
         .iter()
         .filter(|(k, _)| k.as_str() != "commandId" && k.as_str() != "aggregateId")
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, v)| (camel_to_kebab(k.as_str()), v.clone()))
         .collect();
 
-    // 领域参数序列化为 bytes（传递给 WASM）
     let data = serde_json::to_vec(&domain_args)?;
 
     Ok(IncomingCommand { command_id, aggregate_id, data, module: String::new(), command_type: String::new(), validated: false })
 }
+
+/// camelCase → kebab-case 转换
+/// "itemName" → "item-name", "stockCount" → "stock-count"
+fn camel_to_kebab(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            result.push('-');
+            result.push(c.to_lowercase().next().unwrap());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
 ```
+
+> **序列化约定**：Host 将 GraphQL camelCase 参数名转为 WIT kebab-case 后传递给 WASM 组件。
+> WASM 组件的 Rust 结构体应使用 `#[serde(rename_all = "kebab-case")]` 进行反序列化。
+>
+> 示例：
+> ```rust
+> #[derive(Deserialize)]
+> #[serde(rename_all = "kebab-case")]
+> struct CreateItemParams {
+>     item_name: String,    // JSON key: "item-name"
+>     stock_count: u32,     // JSON key: "stock-count"
+> }
+> ```
 
 > **注**：`IncomingCommand` 完整定义见 [command-flow.md](./command-flow.md#incomingcommand-结构统一定义)。
 > 此处 `module` 和 `command_type` 由 GraphQL resolver 填充，`validated` 单机模式始终为 false。
