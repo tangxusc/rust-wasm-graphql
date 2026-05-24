@@ -72,19 +72,14 @@ impl WasmInstancePool {
         })
     }
 
-    /// 从池中获取实例（异步安全：池耗尽时通过 spawn_blocking 创建临时实例）
+    /// 从池中获取实例（池耗尽时直接返回错误，触发上层背压）
     pub async fn acquire(&self) -> Result<PooledInstance> {
         match self.pool.pop() {
             Some(instance) => Ok(PooledInstance::pooled(instance, self.pool.clone())),
             None => {
-                // 池耗尽：在阻塞线程池中创建临时实例，避免阻塞 tokio worker
-                let engine = self.engine.clone();
-                let component = self.component.clone();
-                let linker = self.linker.clone();
-                let instance = tokio::task::spawn_blocking(move || {
-                    Self::create_instance(&engine, &component, &linker)
-                }).await.map_err(|e| Error::internal(e.to_string()))??;
-                Ok(PooledInstance::temporary(instance))
+                // 池耗尽：直接返回错误，由上层背压机制（503）通知客户端退避重试
+                // 不创建临时实例，防止持续高负载下内存无限增长
+                Err(Error::pool_exhausted(&self.module_name))
             }
         }
     }
@@ -106,20 +101,16 @@ impl WasmInstancePool {
     }
 }
 
-/// RAII 守卫：pooled 实例 Drop 时归还池，temporary 实例 Drop 时直接丢弃
+/// RAII 守卫：Drop 时归还池
 pub struct PooledInstance {
     instance: Option<WasmInstance>,
-    return_to: Option<Arc<ArrayQueue<WasmInstance>>>,  // None = temporary
+    return_to: Arc<ArrayQueue<WasmInstance>>,
     trapped: bool,  // WASM 函数是否发生 trap
 }
 
 impl PooledInstance {
-    fn pooled(instance: WasmInstance, pool: Arc<ArrayQueue<WasmInstance>>) -> Self {
-        Self { instance: Some(instance), return_to: Some(pool), trapped: false }
-    }
-
-    fn temporary(instance: WasmInstance) -> Self {
-        Self { instance: Some(instance), return_to: None, trapped: false }
+    fn new(instance: WasmInstance, pool: Arc<ArrayQueue<WasmInstance>>) -> Self {
+        Self { instance: Some(instance), return_to: pool, trapped: false }
     }
 
     pub fn call_function(&mut self, func_name: &str, args: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, String> {
@@ -165,10 +156,7 @@ impl Drop for PooledInstance {
                 return;
             }
             instance.store.data_mut().reset();
-            // 仅 pooled 实例归还池；temporary 实例直接丢弃
-            if let Some(ref pool) = self.return_to {
-                let _ = pool.push(instance);
-            }
+            let _ = self.return_to.push(instance);
         }
     }
 }
@@ -258,7 +246,7 @@ impl PoolSizePolicy {
 |------|-----------------|-----------------|
 | 实例化延迟 | 100-500μs | 0（已预热） |
 | acquire 延迟（池命中） | N/A | ~50ns（无锁 pop） |
-| acquire 延迟（池耗尽） | N/A | 100-500μs（spawn_blocking 创建临时实例） |
+| acquire 延迟（池耗尽） | N/A | 立即返回错误（503），由背压机制处理 |
 | Linker 创建 | 每次重新创建 | 共享复用（零开销） |
 | 内存占用 | 波动大 | 稳定（池大小 × 实例内存） |
 | GC 压力 | 高（频繁分配释放） | 无 |
@@ -284,8 +272,9 @@ WASM 组件模型保证实例间完全隔离：
 - `Drop` 时检查：`trapped` 为 true 则直接丢弃实例，不归还池
 - 池大小短暂减少后，后续请求通过 `spawn_blocking` 创建临时实例补充
 
-这意味着在 WASM 组件频繁 trap 的场景下，池会逐渐耗空，退化为每次创建临时实例。
-这是正确的行为——频繁 trap 说明组件有 bug，性能退化可作为报警信号。
+这意味着在 WASM 组件频繁 trap 的场景下，池会逐渐耗空，开始拒绝请求（503）。
+这是正确的行为——频繁 trap 说明组件有 bug，请求拒绝可作为报警信号，
+配合后台 replenisher 补充实例实现自愈。
 
 ### 池自愈：后台定时补充
 
@@ -351,7 +340,7 @@ impl WasmInstancePool {
 ```
 Virtual Actor 收到命令（已在内存中激活）
     │
-    ├── pool.acquire("inventory").await  ← 池命中时 ~50ns（无锁），池耗尽时 spawn_blocking
+    ├── pool.acquire("inventory").await  ← 池命中时 ~50ns（无锁），池耗尽时返回 503
     │
     ├── instance.call_function("handle-create-item", &[state, cmd])
     │

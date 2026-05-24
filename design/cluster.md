@@ -185,6 +185,7 @@ impl VirtualActor {
     async fn process_command(&mut self, cmd: IncomingCommand) -> Result<CommandResult> {
         // 写入前检查 lease 是否仍然有效
         if !self.lease_guard.is_valid() {
+            self.poison_and_deactivate().await;
             return Err(Error::lease_expired(
                 "Lease 续约失败，Actor 已失效，请重试"
             ));
@@ -193,21 +194,54 @@ impl VirtualActor {
         // ... validate, handle ...
 
         // 持久化时携带 fencing_token（集群模式 Some，单机模式 None）
-        self.event_store.append_with_idempotency(
+        let persist_result = self.event_store.append_with_idempotency(
             &self.aggregate_id,
             &events_to_persist,
             self.version,
             &cmd.command_id,
             Some(self.lease_guard.fencing_token()),
-        ).await?;
+        ).await;
+
+        // Fencing token 被拒绝：说明 lease 已被其他节点接管，立即自我 poison + 休眠
+        if let Err(StoreError::FencingTokenExpired { .. }) = &persist_result {
+            self.poison_and_deactivate().await;
+        }
+        persist_result?;
 
         // ...
+    }
+
+    /// 标记自身为 poisoned 并触发休眠，从 active 表中移除
+    /// 后续请求将触发重新激活（获取新 lease）
+    async fn poison_and_deactivate(&mut self) {
+        self.poisoned = true;
+        // 不保存快照：状态可能已过期（其他节点可能已写入新事件）
+        self.handle.notify_exit().await;
     }
 }
 ```
 
+**Fencing 失败恢复流程**：
+
+```
+Actor 写入 Event Store 被 fencing_token 拒绝
+    │
+    ├── 1. 标记 self.poisoned = true
+    │
+    ├── 2. 不保存快照（状态可能已过期）
+    │
+    ├── 3. 通知 Runtime 自身已退出（notify_exit）
+    │
+    ├── 4. 返回错误给客户端（"请重试"）
+    │
+    └── 5. Actor 从 active 表移除，后续请求触发重新激活
+           - 重新激活时获取新 lease（如果本节点仍是 owner）
+           - 或路由到新 owner 节点（哈希环已更新）
+```
+
 **保证**：即使旧节点在 lease 过期后仍尝试写入，Event Store 会因 fencing_token 过期而拒绝，
-新节点的写入不会被覆盖。客户端收到错误后重试即可路由到新节点。
+新节点的写入不会被覆盖。旧 Actor 立即自我 poison 并退出，不会持续占用 active 槽位。
+客户端收到错误后重试即可路由到正确节点。
 
 ### Lease 与 Actor 生命周期绑定
 

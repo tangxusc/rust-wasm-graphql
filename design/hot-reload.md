@@ -215,11 +215,13 @@ impl HotReloadWatcher {
 
 ## 灰度发布
 
-### 基于流量比例的灰度
+### 双版本 Actor 并存灰度
+
+灰度以聚合为粒度分配版本，同一聚合始终使用同一版本处理，避免新旧版本混合处理导致的一致性问题。
 
 ```rust
 pub struct CanaryConfig {
-    /// 灰度比例（0.0 - 1.0）
+    /// 灰度比例（0.0 - 1.0），按聚合哈希决定归属
     pub traffic_ratio: f64,
     /// 灰度持续时间（观察期）
     pub observation_period: Duration,
@@ -238,10 +240,15 @@ pub struct CanaryDeployment {
 }
 
 impl CanaryDeployment {
-    /// 根据灰度比例选择实例池
-    pub async fn acquire(&self) -> Result<PooledInstance> {
-        let use_new = rand::random::<f64>() < self.config.traffic_ratio;
-        if use_new {
+    /// 按聚合粒度决定使用新/旧版本（同一聚合始终使用同一版本）
+    pub fn use_new_version(&self, aggregate_id: &str) -> bool {
+        let hash = hash_aggregate_id(aggregate_id);
+        (hash as f64 / u64::MAX as f64) < self.config.traffic_ratio
+    }
+
+    /// 获取指定聚合应使用的实例池
+    pub async fn acquire(&self, aggregate_id: &str) -> Result<PooledInstance> {
+        if self.use_new_version(aggregate_id) {
             self.new_pool.acquire().await
         } else {
             self.old_pool.acquire().await
@@ -271,6 +278,35 @@ enum CanaryDecision {
 }
 ```
 
+### 双版本 Actor 生命周期
+
+灰度期间，新旧版本各自独立管理 Actor 实例：
+
+- **旧版本聚合**（哈希未命中灰度范围）：继续使用旧池，Actor 保持不变
+- **新版本聚合**（哈希命中灰度范围）：休眠旧 Actor → 清除快照 → 用新池重新激活
+
+```rust
+impl CanaryDeployment {
+    /// 进入灰度阶段：仅休眠命中灰度范围的聚合
+    pub async fn enter_canary(&self, runtime: &VirtualActorRuntime) {
+        let to_migrate: Vec<String> = runtime.active_aggregates(&self.module_name)
+            .filter(|agg_id| self.use_new_version(agg_id))
+            .collect();
+
+        for agg_id in &to_migrate {
+            runtime.deactivate(agg_id).await;
+            runtime.snapshot_store.delete(&self.module_name, agg_id).await.ok();
+        }
+
+        tracing::info!(
+            "灰度启动：{} 个聚合迁移到新版本，{} 个保持旧版本",
+            to_migrate.len(),
+            runtime.active_count(&self.module_name) 
+        );
+    }
+}
+```
+
 ### 灰度流程
 
 ```
@@ -279,20 +315,23 @@ enum CanaryDecision {
     ├── 1. 校验通过，创建新池
     │
     ├── 2. 进入灰度阶段（traffic_ratio = 0.1）
-    │      - 10% 请求使用新组件
-    │      - 90% 请求使用旧组件
+    │      - 按 aggregate_id 哈希决定版本归属
+    │      - 命中灰度范围的聚合：休眠旧 Actor → 用新池重新激活
+    │      - 未命中的聚合：继续使用旧池，不受影响
+    │      - 同一聚合始终使用同一版本，无混合处理风险
     │
     ├── 3. 观察期（默认 5 分钟）
-    │      - 监控新版本错误率
+    │      - 监控新版本聚合的错误率
     │      - 错误率 > rollback_threshold → 自动回滚
     │
     ├── 4a. 晋升（错误率正常）
     │      - traffic_ratio → 1.0
-    │      - 清除快照，休眠 Actor
+    │      - 休眠所有旧版本 Actor，清除快照
     │      - 释放旧池
     │
     └── 4b. 回滚（错误率异常）
            - traffic_ratio → 0.0
+           - 休眠新版本 Actor，清除其快照
            - 释放新池
            - 告警通知
 ```

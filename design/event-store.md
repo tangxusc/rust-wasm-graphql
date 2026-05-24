@@ -72,6 +72,10 @@ pub enum StoreError {
         attempted_version: u64,
     },
     DuplicateCommand(String),
+    FencingTokenExpired {
+        aggregate_id: String,
+        provided_token: u64,
+    },
     ConnectionError(String),
     SerializationError(String),
 }
@@ -407,16 +411,17 @@ pub struct EventStoreConfig {
 ```rust
 impl PgEventStore {
     pub async fn new(config: &EventStoreConfig) -> Result<Self> {
+        let statement_timeout_ms = config.statement_timeout.as_millis();
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)
             .acquire_timeout(config.acquire_timeout)
             .max_lifetime(config.max_lifetime)
             .idle_timeout(config.idle_timeout)
-            .after_connect(|conn, _| Box::pin(async move {
+            .after_connect(move |conn, _| Box::pin(async move {
                 sqlx::query(&format!(
                     "SET statement_timeout = '{}ms'",
-                    config.statement_timeout.as_millis()
+                    statement_timeout_ms
                 ))
                 .execute(conn).await?;
                 Ok(())

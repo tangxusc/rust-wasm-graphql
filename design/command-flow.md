@@ -261,16 +261,18 @@ impl VirtualActorRuntime {
 
         if let Some(id) = candidate {
             if let Some(handle) = self.active.get(&id) {
+                let generation = handle.generation();
                 // 发送 Deactivate 并同步等待 Actor 退出
                 let exit_rx = handle.send_deactivate_and_wait().await;
+                drop(handle);
                 // 等待 Actor 完成快照保存并退出（带超时保护）
                 let _ = tokio::time::timeout(
                     Duration::from_secs(5),
                     exit_rx,
                 ).await;
+                // 仅移除同一 generation 的条目，防止驱逐期间新 Actor 被误删
+                self.active.remove_if(&id, |_, h| h.generation() == generation);
             }
-            // Actor 已退出，从 active 中移除
-            self.active.remove(&id);
             true
         } else {
             false
@@ -348,7 +350,11 @@ impl VirtualActor {
         // 1.5 No-op 处理：handle 返回空事件列表表示命令合法但无副作用
         //     不写幂等键、不写事件，直接返回成功。
         //     重试安全：状态不变 → handle 再次返回空事件 → 再次 no-op。
-        //     前提：handle 必须是确定性的。
+        //
+        //     ⚠️ 硬性前提：handle 必须是确定性的（相同 state + command → 相同结果）。
+        //     如果两次调用之间有其他命令修改了状态，重试可能产出事件——
+        //     这是预期行为：状态已变，命令语义不再是 no-op。
+        //     开发者必须确保 handle 的确定性，否则应始终产出事件（哪怕是标记事件）。
         if new_events.is_empty() {
             return Ok(CommandResult {
                 success: true,
@@ -610,27 +616,15 @@ impl VirtualActorRuntime {
 
 ```rust
 impl VirtualActorRuntime {
+    /// 后台定时驱逐：复用 evict_one 统一逻辑（含 is_busy 保护 + generation 安全移除）
     async fn run_evictor(&self) {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
-            let now = now_millis();
-            let idle_ms = self.idle_timeout.as_millis() as u64;
-
-            let to_evict: Vec<String> = self.active.iter()
-                .filter(|entry| {
-                    let handle = entry.value();
-                    !handle.has_pending_messages()
-                    && (now - handle.last_active()) > idle_ms
-                })
-                .map(|entry| entry.key().clone())
-                .take(self.max_evict_per_tick)  // 每轮最多驱逐 N 个，防止雪崩
-                .collect();
-
-            for id in to_evict {
-                // 仅发送 Deactivate，Actor 自行退出后从 active 移除
-                if let Some(handle) = self.active.get(&id) {
-                    handle.send_deactivate().await;
+            // 每轮最多驱逐 max_evict_per_tick 个，防止雪崩
+            for _ in 0..self.max_evict_per_tick {
+                if !self.evict_one().await {
+                    break;  // 无可驱逐候选者，本轮结束
                 }
             }
         }
