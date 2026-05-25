@@ -20,10 +20,10 @@ CREATE TABLE events (
     metadata        JSONB,
     created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
 
-    UNIQUE (aggregate_id, version)
+    UNIQUE (aggregate_type, aggregate_id, version)
 );
 
-CREATE INDEX idx_events_aggregate ON events (aggregate_id, version);
+CREATE INDEX idx_events_aggregate ON events (aggregate_type, aggregate_id, version);
 
 -- 快照表（每个聚合仅保留最新一份）
 CREATE TABLE snapshots (
@@ -64,6 +64,7 @@ pub struct DomainEvent {
 pub struct PendingEvent {
     pub aggregate_id: String,
     pub aggregate_type: String,
+    pub event_type: String,
     pub version: u64,
     pub data: Vec<u8>,
 }
@@ -95,9 +96,24 @@ pub trait EventStore: Send + Sync {
     /// 加载指定版本之后的增量事件
     async fn load_events_after(
         &self,
+        aggregate_type: &str,
         aggregate_id: &str,
         after_version: u64,
     ) -> Result<Vec<DomainEvent>, StoreError>;
+
+    /// 查询聚合当前版本号（O(1)，用于 GraphQL 查询层）
+    async fn get_current_version(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> Result<Option<u64>, StoreError>;
+
+    /// 检查 aggregate_id 是否已被其他模块占用（跨模块隔离校验）
+    async fn check_aggregate_type_conflict(
+        &self,
+        aggregate_id: &str,
+        expected_type: &str,
+    ) -> Result<bool, StoreError>;
 
     /// 加载快照
     async fn load_snapshot(
@@ -136,7 +152,7 @@ impl EventStore for PgEventStore {
             )
             .bind(aggregate_id)
             .bind(&event.aggregate_type)
-            .bind("domain_event")
+            .bind(&event.event_type)
             .bind(version as i64)
             .bind(&event.data)
             .execute(&mut *tx).await
@@ -155,11 +171,13 @@ impl EventStore for PgEventStore {
     }
 
     async fn save_snapshot(&self, snapshot: &Snapshot) -> Result<(), StoreError> {
+        // 版本守卫：防止异步快照覆盖更新的同步快照
         sqlx::query(
             "INSERT INTO snapshots (aggregate_id, aggregate_type, version, state) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (aggregate_type, aggregate_id) DO UPDATE \
-             SET version = $3, state = $4, created_at = NOW()"
+             SET version = $3, state = $4, created_at = NOW() \
+             WHERE snapshots.version < $3"
         )
         .bind(&snapshot.aggregate_id)
         .bind(&snapshot.aggregate_type)
@@ -167,6 +185,45 @@ impl EventStore for PgEventStore {
         .bind(&snapshot.state)
         .execute(&self.pool).await?;
         Ok(())
+    }
+
+    async fn get_current_version(
+        &self,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> Result<Option<u64>, StoreError> {
+        // MAX(version) 在无匹配行时返回 NULL，使用 Option<i64> 正确处理
+        let row: (Option<i64>,) = sqlx::query_as(
+            "SELECT MAX(version) FROM events \
+             WHERE aggregate_type = $1 AND aggregate_id = $2"
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .fetch_one(&self.pool).await
+        .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+
+        Ok(row.0.map(|v| v as u64))
+    }
+
+    async fn check_aggregate_type_conflict(
+        &self,
+        aggregate_id: &str,
+        expected_type: &str,
+    ) -> Result<bool, StoreError> {
+        // 检查是否存在其他模块使用了相同 aggregate_id
+        let row: (bool,) = sqlx::query_as(
+            "SELECT EXISTS(\
+                SELECT 1 FROM events \
+                WHERE aggregate_id = $1 AND aggregate_type != $2 \
+                LIMIT 1\
+            )"
+        )
+        .bind(aggregate_id)
+        .bind(expected_type)
+        .fetch_one(&self.pool).await
+        .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
+
+        Ok(row.0)
     }
 }
 ```
@@ -190,3 +247,12 @@ pub struct EventStoreConfig {
     pub statement_timeout: Duration, // 默认 5s
 }
 ```
+
+## 事件表增长说明
+
+当前设计不包含事件归档/压缩策略。事件表会持续增长，后续版本需引入：
+- PostgreSQL 表分区（按时间或 aggregate_id hash）
+- 快照成功后归档旧事件
+- 冷存储迁移
+
+单机版暂依赖 PostgreSQL 自身的存储能力，生产部署需监控表大小并规划磁盘容量。

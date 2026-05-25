@@ -7,12 +7,12 @@
 ```
 handle-{command-name}:   func(state: list<u8>, command: list<u8>) -> result<list<list<u8>>, string>;  [必须]
 validate-{command-name}: func(command: list<u8>) -> result<_, string>;                                [可选]
-apply-events:            func(snapshot: list<u8>, events: list<list<u8>>) -> result<list<u8>, string>; [可选]
+apply-events:            func(snapshot: list<u8>, events: list<list<u8>>) -> result<list<u8>, string>; [必须]
 ```
 
 - `handle-{cmd}` 是命令的唯一必要标识
 - `validate-{cmd}` 可选：有则在 handle 前调用，无则跳过
-- `apply-events` 可选：有则调用组件实现，无则 Host 使用 JSON 深度合并
+- `apply-events` 必须实现：负责将事件应用到聚合状态，确保领域事件语义完整
 - 每个命令需定义 `{command-name}-params` record（用于 GraphQL schema 生成）
 
 ## 完整 WIT 示例
@@ -54,6 +54,7 @@ interface aggregate {
     }
 
     handle-increment: func(state: list<u8>, command: list<u8>) -> result<list<list<u8>>, string>;
+    apply-events: func(snapshot: list<u8>, events: list<list<u8>>) -> result<list<u8>, string>;
 }
 
 world counter-aggregate {
@@ -115,23 +116,31 @@ impl CommandDiscovery {
 }
 ```
 
-## WASM 引擎（简化版，无实例池）
+## WASM 引擎（简化版，带 fuel 超时保护）
 
 ```rust
 pub struct WasmEngine {
     engine: wasmtime::Engine,
     modules: HashMap<String, ModuleInfo>,
+    /// 单次调用允许消耗的最大 fuel（防止无限循环）
+    fuel_limit: u64,
 }
 
 struct ModuleInfo {
     component: wasmtime::component::Component,
     linker: wasmtime::component::Linker<WasiState>,
     commands: Vec<CommandDef>,
-    has_apply_events: bool,
 }
 
 impl WasmEngine {
-    /// 每次调用创建新实例（简化版，无实例池）
+    pub fn new(fuel_limit: u64) -> Self {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        Self { engine, modules: HashMap::new(), fuel_limit }
+    }
+
+    /// 每次调用创建新实例，fuel 限制防止无限循环
     pub fn call_handle(
         &self,
         module: &str,
@@ -141,11 +150,12 @@ impl WasmEngine {
     ) -> Result<Vec<Vec<u8>>> {
         let info = self.modules.get(module).ok_or(Error::module_not_found(module))?;
         let mut store = wasmtime::Store::new(&self.engine, WasiState::new());
+        store.set_fuel(self.fuel_limit)?;
         let instance = info.linker.instantiate(&mut store, &info.component)?;
         call_wasm_func(&mut store, &instance, func_name, &[state, command])
     }
 
-    /// 调用 apply-events（有自定义实现时）或使用默认 JSON 深度合并
+    /// 调用组件的 apply-events 实现重建聚合状态
     pub fn call_apply_events(
         &self,
         module: &str,
@@ -153,43 +163,43 @@ impl WasmEngine {
         events: &[&[u8]],
     ) -> Result<Vec<u8>> {
         let info = self.modules.get(module).ok_or(Error::module_not_found(module))?;
-        if info.has_apply_events {
-            let mut store = wasmtime::Store::new(&self.engine, WasiState::new());
-            let instance = info.linker.instantiate(&mut store, &info.component)?;
-            call_wasm_apply(&mut store, &instance, snapshot, events)
-        } else {
-            default_apply_events(snapshot, events)
-        }
+        let mut store = wasmtime::Store::new(&self.engine, WasiState::new());
+        store.set_fuel(self.fuel_limit)?;
+        let instance = info.linker.instantiate(&mut store, &info.component)?;
+        call_wasm_apply(&mut store, &instance, snapshot, events)
     }
 }
 ```
 
-## 默认 apply-events 策略（JSON 深度合并）
+## 领域事件设计规范
 
-省略 `apply-events` 时 Host 使用内置策略：
+`apply-events` 为必须实现的函数，事件必须遵循领域事件最佳实践：
 
-- 事件必须为 JSON 格式
-- 对象字段递归合并，后值覆盖前值
-- 数组字段整体替换
-- null 值表示删除字段
+### 事件设计原则
 
-**约束：事件必须携带字段最终值，而非增量值。**
+1. **事件是已发生的事实** — 使用过去时命名（`ItemCreated`、`StockAdjusted`）
+2. **事件自描述** — 包含足够信息独立解读，无需参照前序状态
+3. **事件携带语义** — 记录业务意图和增量，而非最终状态值
+4. **事件不可变** — 一旦持久化，永不修改
 
-```rust
-fn default_apply_events(snapshot: &[u8], events: &[&[u8]]) -> Result<Vec<u8>> {
-    let mut state: Value = if snapshot.is_empty() {
-        Value::Object(Default::default())
-    } else {
-        serde_json::from_slice(snapshot)?
-    };
+### 事件结构要求
 
-    for event in events {
-        let patch: Value = serde_json::from_slice(event)?;
-        deep_merge(&mut state, &patch);
-    }
+每个事件必须包含 `type` 字段标识事件类型：
 
-    Ok(serde_json::to_vec(&state)?)
+```json
+{
+    "type": "StockAdjusted",
+    "delta": -5,
+    "reason": "sale",
+    "operator": "user-001"
 }
+```
+
+**禁止**仅携带最终值的 patch 式事件：
+
+```json
+// 错误示例：丢失业务语义，无法审计
+{ "quantity": 95 }
 ```
 
 ## WASM 组件实现示例
@@ -229,7 +239,8 @@ impl Guest for Component {
         if new_qty < 0 { return Err(format!("库存不足，当前: {}", current.quantity)); }
         let event = json!({
             "type": "StockAdjusted",
-            "quantity": new_qty as u32,
+            "delta": params.delta,
+            "previous_quantity": current.quantity,
         });
         Ok(vec![serde_json::to_vec(&event).unwrap()])
     }
@@ -246,7 +257,8 @@ impl Guest for Component {
                     state.created = true;
                 }
                 Some("StockAdjusted") => {
-                    state.quantity = event["quantity"].as_u64().unwrap_or(0) as u32;
+                    let delta = event["delta"].as_i64().unwrap_or(0) as i32;
+                    state.quantity = (state.quantity as i64 + delta as i64) as u32;
                 }
                 _ => {}
             }
@@ -264,11 +276,13 @@ Host 加载 WASM 组件时执行校验，启动失败优于运行时错误：
 |--------|----------|
 | `validate-X` 无对应 `handle-X` | 启动失败 |
 | `handle-X` 无对应 `validate-X` | 正常（validate 可选） |
-| 缺少 `apply-events` | 正常（warning，使用默认策略） |
+| 缺少 `apply-events` | 启动失败（必须实现） |
 | 缺少 `{cmd}-params` record | 启动失败 |
 
 ## 设计约束
 
 - 所有聚合接口函数禁止 IO 操作（确保确定性和可测试性）
-- 事件序列化推荐 JSON（兼容默认 apply-events 策略）
+- 事件序列化必须使用 JSON 格式，且包含 `type` 字段
+- `apply-events` 为必须实现，组件负责完整的状态重建逻辑
+- 事件应携带业务语义（增量、意图），而非状态快照
 - 状态体积控制在 10KB 以内（影响内存占用和快照大小）
