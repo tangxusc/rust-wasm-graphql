@@ -1,0 +1,15 @@
+package test:counter;
+
+interface aggregate {
+    record increment-params {
+        amount: u32,
+    }
+
+    validate-increment: func(command: list<u8>) -> result<_, string>;
+    handle-increment: func(state: list<u8>, command: list<u8>) -> result<list<list<u8>>, string>;
+    apply-events: func(snapshot: list<u8>, events: list<list<u8>>) -> result<list<u8>, string>;
+}
+
+world counter-aggregate {
+    export aggregate;
+}
