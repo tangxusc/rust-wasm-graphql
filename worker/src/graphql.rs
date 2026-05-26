@@ -6,6 +6,7 @@ use async_graphql::dynamic::{
     Field, FieldFuture, FieldValue, InputValue, Object, Scalar, Schema, TypeRef,
 };
 
+use crate::command::RecordField;
 use crate::error::WorkerError;
 use crate::types::IncomingCommand;
 
@@ -141,14 +142,16 @@ fn build_aggregate_mutation(
         let module = module_name.to_string();
         let command_type = cmd.name.clone();
         let graphql_name = cmd.graphql_name.clone();
+        let params = cmd.params.clone();
 
         let mut field = Field::new(&graphql_name, TypeRef::named_nn("CommandResult"), move |ctx| {
             let runtime = runtime.clone();
             let module = module.clone();
             let command_type = command_type.clone();
+            let params = params.clone();
 
             FieldFuture::new(async move {
-                let command = extract_command_meta(&ctx, &module, &command_type)
+                let command = extract_command_meta(&ctx, &module, &command_type, &params)
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?;
                 let result = runtime.send(command).await
                     .map_err(|e| async_graphql::Error::new(e.to_string()))?;
@@ -158,9 +161,11 @@ fn build_aggregate_mutation(
         .argument(InputValue::new("aggregateId", TypeRef::named_nn(TypeRef::STRING)))
         .argument(InputValue::new("expectedVersion", TypeRef::named_nn("UInt64")));
 
-        // 添加领域参数（从 WIT record 推导）
-        // 简化实现：根据命令名推断常见参数
-        field = add_domain_args(field, &cmd.name);
+        // 从 WIT record 动态添加领域参数
+        for param in &cmd.params {
+            let gql_type = wit_type_to_graphql_type(&param.wit_type);
+            field = field.argument(InputValue::new(&param.name, gql_type));
+        }
 
         obj = obj.field(field);
     }
@@ -168,22 +173,15 @@ fn build_aggregate_mutation(
     obj
 }
 
-/// 根据命令名添加领域参数的简化实现
-/// 完整版本需要从 WIT record 定义提取参数
-fn add_domain_args(field: Field, cmd_name: &str) -> Field {
-    match cmd_name {
-        "increment" => {
-            field.argument(InputValue::new("amount", TypeRef::named_nn(TypeRef::INT)))
-        }
-        "create-item" => {
-            field
-                .argument(InputValue::new("name", TypeRef::named_nn(TypeRef::STRING)))
-                .argument(InputValue::new("quantity", TypeRef::named_nn(TypeRef::INT)))
-        }
-        "adjust-stock" => {
-            field.argument(InputValue::new("delta", TypeRef::named_nn(TypeRef::INT)))
-        }
-        _ => field,
+/// 将 WIT 类型字符串映射到 GraphQL TypeRef
+fn wit_type_to_graphql_type(wit_type: &str) -> TypeRef {
+    match wit_type {
+        "bool" => TypeRef::named_nn(TypeRef::BOOLEAN),
+        "u8" | "u16" | "u32" | "s8" | "s16" | "s32" => TypeRef::named_nn(TypeRef::INT),
+        "u64" | "s64" => TypeRef::named_nn("UInt64"),
+        "f32" | "f64" => TypeRef::named_nn(TypeRef::FLOAT),
+        "string" | "char" => TypeRef::named_nn(TypeRef::STRING),
+        _ => TypeRef::named_nn(TypeRef::STRING), // 复杂类型降级
     }
 }
 
@@ -234,6 +232,7 @@ fn extract_command_meta(
     ctx: &async_graphql::dynamic::ResolverContext<'_>,
     module: &str,
     command_type: &str,
+    params: &[RecordField],
 ) -> Result<IncomingCommand, WorkerError> {
     let aggregate_id = ctx.args.try_get("aggregateId")
         .map_err(|_| WorkerError::MissingField("aggregateId".into()))?
@@ -250,10 +249,8 @@ fn extract_command_meta(
         .parse()
         .map_err(|_| WorkerError::InvalidInput("expectedVersion 必须为有效的非负整数".into()))?;
 
-    // 提取所有领域参数（排除 aggregateId 和 expectedVersion）
-    // async-graphql dynamic API 无法枚举所有参数，
-    // 所以通过 try_get 逐个提取已知参数名
-    let data = extract_domain_args(ctx);
+    // 根据 WIT record 字段动态提取领域参数
+    let data = extract_domain_args(ctx, params);
 
     Ok(IncomingCommand {
         aggregate_id,
@@ -264,46 +261,52 @@ fn extract_command_meta(
     })
 }
 
-/// 提取领域参数并序列化为 JSON
-fn extract_domain_args(ctx: &async_graphql::dynamic::ResolverContext<'_>) -> Vec<u8> {
-    // 简化实现：将整个 ctx.args 序列化
-    // 在动态 API 中，我们通过 try_get 逐个提取参数
-    // 对于当前测试计数器场景，仅需要 amount 参数
+/// 根据 WIT record 字段动态提取领域参数并序列化为 JSON
+fn extract_domain_args(
+    ctx: &async_graphql::dynamic::ResolverContext<'_>,
+    params: &[RecordField],
+) -> Vec<u8> {
     let mut map = serde_json::Map::new();
 
-    // 尝试提取 amount 参数（整数类型）
-    if let Ok(val) = ctx.args.try_get("amount") {
-        if let Ok(n) = val.i64() {
-            map.insert("amount".into(), serde_json::json!(n));
-        } else if let Ok(s) = val.string() {
-            if let Ok(n) = s.parse::<i64>() {
-                map.insert("amount".into(), serde_json::json!(n));
+    for param in params {
+        if let Ok(val) = ctx.args.try_get(&param.name) {
+            if let Some(json_val) = extract_value_by_wit_type(&val, &param.wit_type) {
+                map.insert(param.name.clone(), json_val);
             }
         }
     }
 
-    // 尝试提取 name 参数（字符串类型）
-    if let Ok(val) = ctx.args.try_get("name") {
-        if let Ok(s) = val.string() {
-            map.insert("name".into(), serde_json::json!(s));
-        }
-    }
-
-    // 尝试提取 quantity 参数（整数类型）
-    if let Ok(val) = ctx.args.try_get("quantity") {
-        if let Ok(n) = val.i64() {
-            map.insert("quantity".into(), serde_json::json!(n));
-        }
-    }
-
-    // 尝试提取 delta 参数（整数类型）
-    if let Ok(val) = ctx.args.try_get("delta") {
-        if let Ok(n) = val.i64() {
-            map.insert("delta".into(), serde_json::json!(n));
-        }
-    }
-
     serde_json::to_vec(&map).unwrap_or_default()
+}
+
+/// 根据 WIT 类型从 GraphQL ValueAccessor 提取对应的 JSON 值
+fn extract_value_by_wit_type(val: &async_graphql::dynamic::ValueAccessor<'_>, wit_type: &str) -> Option<serde_json::Value> {
+    match wit_type {
+        "bool" => val.boolean().ok().map(serde_json::Value::Bool),
+        "u8" | "u16" | "u32" | "s8" | "s16" | "s32" => {
+            val.i64().ok().map(|n| serde_json::json!(n))
+        }
+        "u64" | "s64" => {
+            // GraphQL UInt64 通过字符串传递，避免 32 位溢出
+            if let Ok(s) = val.string() {
+                s.parse::<u64>().ok().map(|n| serde_json::json!(n))
+            } else if let Ok(n) = val.i64() {
+                Some(serde_json::json!(n))
+            } else {
+                None
+            }
+        }
+        "f32" | "f64" => {
+            val.f64().ok().map(|n| serde_json::json!(n))
+        }
+        "string" | "char" => {
+            val.string().ok().map(|s| serde_json::json!(s))
+        }
+        _ => {
+            // 复杂类型（如 Type::Id）降级：先尝试 string，再尝试原始值
+            val.string().ok().map(|s| serde_json::json!(s))
+        }
+    }
 }
 
 // ===== 测试 =====
@@ -402,51 +405,73 @@ mod tests {
         assert_eq!(camel_to_kebab("aggregateId"), "aggregate-id");
     }
 
-    // === add_domain_args 测试 ===
+    // === wit_type_to_graphql_type 测试 ===
 
     #[test]
-    fn test_add_domain_args_increment() {
-        let field = Field::new("increment", TypeRef::named_nn("CommandResult"), |_| {
-            FieldFuture::new(async { Ok(Some(FieldValue::NULL)) })
-        });
-        let field = add_domain_args(field, "increment");
-        // 验证不崩溃 - 无法直接用单元测试验证参数添加
-        let _ = field;
+    fn test_wit_type_to_graphql_bool() {
+        let t = wit_type_to_graphql_type("bool");
+        assert_eq!(t.to_string(), "Boolean!");
     }
 
     #[test]
-    fn test_add_domain_args_create_item() {
-        let field = Field::new("createItem", TypeRef::named_nn("CommandResult"), |_| {
-            FieldFuture::new(async { Ok(Some(FieldValue::NULL)) })
-        });
-        let field = add_domain_args(field, "create-item");
-        let _ = field;
+    fn test_wit_type_to_graphql_int_types() {
+        for wit in &["u8", "u16", "u32", "s8", "s16", "s32"] {
+            let t = wit_type_to_graphql_type(wit);
+            assert_eq!(t.to_string(), "Int!", "类型 {} 应对应 Int!", wit);
+        }
     }
 
     #[test]
-    fn test_add_domain_args_adjust_stock() {
-        let field = Field::new("adjustStock", TypeRef::named_nn("CommandResult"), |_| {
-            FieldFuture::new(async { Ok(Some(FieldValue::NULL)) })
-        });
-        let field = add_domain_args(field, "adjust-stock");
-        let _ = field;
+    fn test_wit_type_to_graphql_uint64() {
+        for wit in &["u64", "s64"] {
+            let t = wit_type_to_graphql_type(wit);
+            assert_eq!(t.to_string(), "UInt64!", "类型 {} 应对应 UInt64!", wit);
+        }
     }
 
     #[test]
-    fn test_add_domain_args_unknown_command() {
-        let field = Field::new("unknownCmd", TypeRef::named_nn("CommandResult"), |_| {
-            FieldFuture::new(async { Ok(Some(FieldValue::NULL)) })
-        });
-        let field = add_domain_args(field, "unknown-command");
-        let _ = field;
+    fn test_wit_type_to_graphql_string() {
+        for wit in &["string", "char"] {
+            let t = wit_type_to_graphql_type(wit);
+            assert_eq!(t.to_string(), "String!", "类型 {} 应对应 String!", wit);
+        }
     }
-
-    // === extract_domain_args 测试（使用 Mock ResolverContext）===
 
     #[test]
-    fn test_extract_domain_args_empty() {
-        // 无法在单元测试中创建 ResolverContext，通过集成测试覆盖
+    fn test_wit_type_to_graphql_float() {
+        for wit in &["f32", "f64"] {
+            let t = wit_type_to_graphql_type(wit);
+            assert_eq!(t.to_string(), "Float!", "类型 {} 应对应 Float!", wit);
+        }
     }
+
+    #[test]
+    fn test_wit_type_to_graphql_unknown_fallback() {
+        let t = wit_type_to_graphql_type("complex-type");
+        assert_eq!(t.to_string(), "String!");
+    }
+
+    // === RecordField 结构测试 ===
+
+    #[test]
+    fn test_record_field_creation() {
+        let field = RecordField { name: "amount".into(), wit_type: "u32".into() };
+        assert_eq!(field.name, "amount");
+        assert_eq!(field.wit_type, "u32");
+    }
+
+    #[test]
+    fn test_record_field_vec() {
+        let params = vec![
+            RecordField { name: "amount".into(), wit_type: "u32".into() },
+            RecordField { name: "name".into(), wit_type: "string".into() },
+        ];
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "amount");
+        assert_eq!(params[1].wit_type, "string");
+    }
+
+    // === extract_domain_args 通过 e2e 测试覆盖，无法在单元测试中构造 ResolverContext ===
 
     // === Schema 构建测试 ===
 

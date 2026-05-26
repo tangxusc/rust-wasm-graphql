@@ -697,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn test_runtime_overloaded_channel_full() {
         // 使用极小 channel 容量制造背压
-        let config = RuntimeConfig {
+        let _config = RuntimeConfig {
             runtime_channel_capacity: 1,
             max_active: 100,
             ..Default::default()

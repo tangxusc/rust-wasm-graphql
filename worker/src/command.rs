@@ -8,6 +8,15 @@ pub struct ExportedFunctionInfo {
     pub wit_name: String,
 }
 
+/// Record 字段定义（从 WIT record 解析）
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordField {
+    /// 字段名（kebab-case）
+    pub name: String,
+    /// WIT 类型名（如 "u32", "string", "u64"）
+    pub wit_type: String,
+}
+
 /// 发现的命令定义
 #[derive(Debug, Clone)]
 pub struct CommandDef {
@@ -19,6 +28,8 @@ pub struct CommandDef {
     pub validate_fn: Option<String>,
     /// 命令处理函数名（如 "handle-create-item"）
     pub handle_fn: String,
+    /// 从 WIT {cmd}-params record 解析的领域参数
+    pub params: Vec<RecordField>,
 }
 
 /// 将 kebab-case 转换为 camelCase
@@ -94,6 +105,7 @@ pub fn discover_commands(functions: &[ExportedFunctionInfo]) -> Result<Vec<Comma
             graphql_name: kebab_to_camel(cmd),
             validate_fn: validates.get(cmd).map(|f| f.wit_name.clone()),
             handle_fn: handle_ref.wit_name.clone(),
+            params: Vec::new(), // 由调用方在 WIT 解析后填充
         }
     }).collect();
 

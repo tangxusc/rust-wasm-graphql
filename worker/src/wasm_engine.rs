@@ -8,9 +8,9 @@ use wasmtime::component::{Component, ComponentExportIndex, Linker, Val};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 use wit_parser::decoding::{decode, DecodedWasm};
-use wit_parser::WorldItem;
+use wit_parser::{Type, TypeDefKind, WorldItem};
 
-use crate::command::{discover_commands, CommandDef, ExportedFunctionInfo};
+use crate::command::{discover_commands, CommandDef, ExportedFunctionInfo, RecordField};
 use crate::config::RuntimeConfig;
 use crate::error::WorkerError;
 
@@ -65,8 +65,8 @@ impl WasmEngine {
         let wasm_bytes = std::fs::read(wasm_path)
             .map_err(|e| WorkerError::WasmExecution(format!("读取文件失败: {e}")))?;
 
-        // 从 WIT 元数据提取函数列表用于命令发现
-        let (wit_funcs, _module_name) = extract_wit_functions(&wasm_bytes)
+        // 从 WIT 元数据提取函数列表和 record 类型
+        let (wit_funcs, records, _module_name) = extract_wit_functions(&wasm_bytes)
             .map_err(|e| WorkerError::WasmExecution(format!("WIT 解析失败: {e}")))?;
 
         // 命令发现
@@ -74,8 +74,19 @@ impl WasmEngine {
             .iter()
             .map(|(name, _, _)| ExportedFunctionInfo { wit_name: name.clone() })
             .collect();
-        let commands = discover_commands(&func_infos)
+        let mut commands = discover_commands(&func_infos)
             .map_err(|e| WorkerError::WasmExecution(format!("命令发现失败: {e}")))?;
+
+        // 从 WIT {cmd}-params record 填充领域参数，并校验完整
+        for cmd in &mut commands {
+            if let Some(fields) = records.get(cmd.name.as_str()) {
+                cmd.params = fields.clone();
+            } else {
+                return Err(WorkerError::WasmExecution(format!(
+                    "命令 '{}' 缺少对应的 {}-params record 定义", cmd.name, cmd.name
+                )));
+            }
+        }
 
         // 编译组件
         let component = Component::new(&self.engine, &wasm_bytes)
@@ -383,10 +394,10 @@ fn parse_state_result(val: &Val) -> Result<Vec<u8>, WorkerError> {
     }
 }
 
-/// 从 WIT 元数据提取函数名和参数/返回类型
+/// 从 WIT 元数据提取函数名、参数/返回类型以及 record 定义
 fn extract_wit_functions(
     wasm_bytes: &[u8],
-) -> Result<(Vec<(String, Vec<(String, String)>, String)>, String)> {
+) -> Result<(Vec<(String, Vec<(String, String)>, String)>, std::collections::HashMap<String, Vec<RecordField>>, String)> {
     let decoded = decode(wasm_bytes)
         .map_err(|e| anyhow!("WIT 解码失败: {e}"))?;
 
@@ -400,6 +411,7 @@ fn extract_wit_functions(
     let world = &resolve.worlds[world_id];
     let mut module_name = String::from("unknown");
     let mut funcs = Vec::new();
+    let mut records: std::collections::HashMap<String, Vec<RecordField>> = std::collections::HashMap::new();
 
     for (_key, item) in &world.exports {
         match item {
@@ -416,6 +428,21 @@ fn extract_wit_functions(
                     let result_type = format!("{:?}", func.results);
                     funcs.push((func_name.clone(), params, result_type));
                 }
+                // 提取接口中的 record 类型（{cmd}-params 命名约定）
+                for (type_name, type_id) in &iface.types {
+                    if let Some(cmd_name) = type_name.strip_suffix("-params") {
+                        let type_def = &resolve.types[*type_id];
+                        if let TypeDefKind::Record(record) = &type_def.kind {
+                            let fields: Vec<RecordField> = record.fields.iter().map(|f| {
+                                RecordField {
+                                    name: f.name.clone(),
+                                    wit_type: wit_type_to_string(&f.ty),
+                                }
+                            }).collect();
+                            records.insert(cmd_name.to_string(), fields);
+                        }
+                    }
+                }
             }
             WorldItem::Function(func) => {
                 let params: Vec<(String, String)> = func.params.iter()
@@ -424,11 +451,47 @@ fn extract_wit_functions(
                 let result_type = format!("{:?}", func.results);
                 funcs.push((func.name.clone(), params, result_type));
             }
-            WorldItem::Type(_) => {}
+            WorldItem::Type(id) => {
+                // world 级别直接定义的类型（非接口内）
+                let type_def = &resolve.types[*id];
+                if let Some(type_name) = &type_def.name {
+                    if let Some(cmd_name) = type_name.strip_suffix("-params") {
+                        if let TypeDefKind::Record(record) = &type_def.kind {
+                            let fields: Vec<RecordField> = record.fields.iter().map(|f| {
+                                RecordField {
+                                    name: f.name.clone(),
+                                    wit_type: wit_type_to_string(&f.ty),
+                                }
+                            }).collect();
+                            records.insert(cmd_name.to_string(), fields);
+                        }
+                    }
+                }
+            }
         }
     }
 
-    Ok((funcs, module_name))
+    Ok((funcs, records, module_name))
+}
+
+/// 将 WIT Type 转换为字符串表示（如 Type::U32 → "u32"）
+fn wit_type_to_string(ty: &Type) -> String {
+    match ty {
+        Type::Bool => "bool".into(),
+        Type::U8 => "u8".into(),
+        Type::U16 => "u16".into(),
+        Type::U32 => "u32".into(),
+        Type::U64 => "u64".into(),
+        Type::S8 => "s8".into(),
+        Type::S16 => "s16".into(),
+        Type::S32 => "s32".into(),
+        Type::S64 => "s64".into(),
+        Type::F32 => "f32".into(),
+        Type::F64 => "f64".into(),
+        Type::Char => "char".into(),
+        Type::String => "string".into(),
+        Type::Id(_) => "string".into(), // 复杂类型降级为 JSON string
+    }
 }
 
 /// 从 WASM 组件的 WIT 包名中提取模块名（取冒号后的第二部分）
@@ -614,6 +677,10 @@ mod tests {
         assert_eq!(cmds[0].name, "increment");
         assert_eq!(cmds[0].graphql_name, "increment");
         assert!(cmds[0].handle_fn.contains("handle"));
+        // 验证从 WIT record 提取的领域参数
+        assert_eq!(cmds[0].params.len(), 1);
+        assert_eq!(cmds[0].params[0].name, "amount");
+        assert_eq!(cmds[0].params[0].wit_type, "u32");
     }
 
     #[test]
@@ -680,7 +747,7 @@ mod tests {
     #[test]
     fn test_create_new_store_works() {
         let config = RuntimeConfig::default();
-        let engine = WasmEngine::new(&config);
+        let _engine = WasmEngine::new(&config);
         // new_store() 是私有方法，通过调用 load + handle 间接测试
     }
 
@@ -804,7 +871,7 @@ mod tests {
     fn test_extract_wit_from_counter_wasm() {
         let wasm_path = test_wasm_path();
         let bytes = std::fs::read(&wasm_path).unwrap();
-        let (funcs, module_name) = super::extract_wit_functions(&bytes).unwrap();
+        let (funcs, records, module_name) = super::extract_wit_functions(&bytes).unwrap();
         assert_eq!(module_name, "counter");
         assert!(!funcs.is_empty());
         // 应该包含 handle-increment, validate-increment, apply-events
@@ -812,6 +879,12 @@ mod tests {
         assert!(names.iter().any(|n| n.contains("handle")));
         assert!(names.iter().any(|n| n.contains("validate")));
         assert!(names.iter().any(|n| n.contains("apply")));
+        // 应该包含 increment-params record 的字段
+        assert!(records.contains_key("increment"));
+        let fields = &records["increment"];
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "amount");
+        assert_eq!(fields[0].wit_type, "u32");
     }
 
     #[test]
