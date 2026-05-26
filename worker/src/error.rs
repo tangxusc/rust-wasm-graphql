@@ -300,4 +300,20 @@ mod tests {
         let cloned = err.clone();
         assert_eq!(err.to_string(), cloned.to_string());
     }
+
+    #[test]
+    fn test_from_sqlx_error_to_store_error() {
+        let sqlx_err = sqlx::Error::Protocol("test protocol error".to_string());
+        let store_err: StoreError = sqlx_err.into();
+        assert!(matches!(store_err, StoreError::ConnectionError(_)));
+        assert!(store_err.to_string().contains("test protocol error"));
+    }
+
+    #[test]
+    fn test_from_sqlx_error_to_worker_error() {
+        let sqlx_err = sqlx::Error::Protocol("test protocol error".to_string());
+        let worker_err: WorkerError = sqlx_err.into();
+        assert!(matches!(worker_err, WorkerError::Store(_)));
+        assert!(worker_err.to_string().contains("test protocol error"));
+    }
 }

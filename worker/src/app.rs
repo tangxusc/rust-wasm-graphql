@@ -13,11 +13,11 @@ use crate::graphql::build_dynamic_schema;
 use crate::runtime::{RuntimeHandle, VirtualActorRuntime};
 use crate::wasm_engine::WasmEngine;
 
-async fn health() -> impl IntoResponse {
+pub(crate) async fn health() -> impl IntoResponse {
     "OK"
 }
 
-async fn graphiql() -> impl IntoResponse {
+pub(crate) async fn graphiql() -> impl IntoResponse {
     Html(GraphiQLSource::build().endpoint("/graphql").finish())
 }
 
@@ -169,6 +169,22 @@ mod tests {
         assert!(!modules.is_empty());
         // 应该包含 counter 模块
         assert!(modules.iter().any(|(name, _, _)| name == "counter"));
+    }
+
+    #[tokio::test]
+    async fn test_health_handler() {
+        let response = health().await.into_response();
+        let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body, "OK");
+    }
+
+    #[tokio::test]
+    async fn test_graphiql_handler() {
+        let response = graphiql().await.into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 10240).await.unwrap();
+        assert!(status.is_success()); // 2xx 响应即为成功
+        assert!(!body.is_empty(), "GraphiQL HTML 不应为空");
     }
 
     #[tokio::test]

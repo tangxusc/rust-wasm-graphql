@@ -647,4 +647,85 @@ mod tests {
         assert_eq!(result.event_count, 0);
         assert_eq!(actor.version, 5); // actor 版本不变
     }
+
+    #[tokio::test]
+    async fn test_run_exits_on_channel_close() {
+        let (mut actor, actor_tx, mut runtime_rx) = setup_actor();
+        actor.idle_timeout = std::time::Duration::from_secs(3600);
+
+        // drop sender 使得 rx.recv() 返回 None
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = make_command("agg-1", 0, "increment");
+        let _ = actor_tx.send(ActorMessage::Command { command: cmd, reply_tx }).await;
+        drop(actor_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), actor.run())
+            .await
+            .unwrap();
+
+        // 验证收到 ActorStopped
+        let stopped = runtime_rx.try_recv();
+        assert!(stopped.is_ok(), "channel 关闭后应发送 ActorStopped");
+        let _ = reply_rx;
+    }
+
+    #[tokio::test]
+    async fn test_run_exits_on_idle_timeout() {
+        let (mut actor, _actor_tx, mut runtime_rx) = setup_actor();
+        // 设置超短空闲超时使其在首次 idle_check 时触发
+        actor.last_active = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        actor.idle_timeout = std::time::Duration::from_millis(1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), actor.run())
+            .await
+            .unwrap();
+
+        // 验证发送了 ActorStopped
+        let stopped = runtime_rx.try_recv();
+        assert!(stopped.is_ok(), "空闲超时后应发送 ActorStopped");
+    }
+
+    // === MockEventStore 方法直接测试（覆盖 trait 实现中的未覆盖分支）===
+
+    #[tokio::test]
+    async fn test_mock_store_load_events_after() {
+        let store = MockEventStore::new();
+        let result = store.load_events_after("counter", "agg-1", 0).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mock_store_get_current_version() {
+        let store = MockEventStore::new();
+        let result = store.get_current_version("counter", "agg-1").await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_mock_store_check_type_conflict() {
+        let store = MockEventStore::new();
+        let result = store.check_aggregate_type_conflict("agg-1", "counter").await.unwrap();
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn test_mock_store_load_snapshot() {
+        let store = MockEventStore::new();
+        let result = store.load_snapshot("counter", "agg-1").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_mock_store_save_snapshot() {
+        let store = MockEventStore::new();
+        let snap = Snapshot {
+            aggregate_id: "agg-1".into(),
+            aggregate_type: "counter".into(),
+            version: 1,
+            state: vec![1, 2, 3],
+        };
+        store.save_snapshot(&snap).await.unwrap();
+        let loaded = store.load_snapshot("counter", "agg-1").await.unwrap().unwrap();
+        assert_eq!(loaded.version, 1);
+    }
 }

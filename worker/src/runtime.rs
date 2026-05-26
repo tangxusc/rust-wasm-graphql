@@ -847,5 +847,33 @@ mod tests {
         assert!(r2.success);
     }
 
+    // === ActorHandle 测试 ===
+
+    #[test]
+    fn test_actor_handle_touch() {
+        let (tx, _rx) = mpsc::channel::<ActorMessage>(1);
+        let handle = ActorHandle {
+            tx,
+            generation: 1,
+            last_active: Arc::new(AtomicU64::new(0)),
+        };
+        handle.touch();
+        let val = handle.last_active.load(Ordering::Relaxed);
+        assert!(val > 0, "touch() 应更新 last_active");
+    }
+
+    // === Runtime 错误路径测试 ===
+
+    #[tokio::test]
+    async fn test_runtime_channel_closed_error() {
+        // 当 receiver 被 drop 时 send 应返回错误
+        let (tx, rx) = mpsc::channel::<RuntimeMessage>(1);
+        let handle = RuntimeHandle { tx };
+        drop(rx); // 关闭接收端，使 send 返回 Closed
+        let result = handle.send(make_command("closed2", "counter", 0)).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("已关闭"));
+    }
+
 }
 

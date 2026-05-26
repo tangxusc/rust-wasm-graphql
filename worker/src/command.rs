@@ -195,4 +195,18 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("validate-orphaned"));
     }
+
+    #[test]
+    fn test_validate_empty_command_name() {
+        let result = discover(&["handle-something", "validate-", "apply-events"]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("命令名为空"));
+    }
+
+    #[test]
+    fn test_only_apply_events_no_handle() {
+        let result = discover(&["apply-events"]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("未发现任何 handle-X"));
+    }
 }
